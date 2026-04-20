@@ -1,42 +1,35 @@
 from pyqtgraph.Qt import QtGui
 import numpy as np
 import pyqtgraph as pg
+from hepunits import*
 
 pg.setConfigOption('background', 'w')
 pg.setConfigOption('foreground', 'k')
 
-energySpectrums = np.load('Numpy data/efg3_32_spectrums.npy')
-# energySpectrums = np.load('Processed data/PS10EnergySpectums.npy') + 1
+energy_spectrum = np.load('Numpy data/lung_cancer_new_sum_spectrum.npy')
+energy = energy_spectrum[:, 0]
+counts = energy_spectrum[:, 1]
+
+lower_ground = np.searchsorted(energy, 126*keV)
+upper_ground = np.searchsorted(energy, 154*keV)
+lower_peak = np.searchsorted(energy, 140*keV)
+upper_peak = np.searchsorted(energy, 141*keV)
+
+ground_sum = counts[lower_ground:upper_ground].sum()
+peak_sum = counts[lower_peak:upper_peak].sum()
+
+print(100*(1 - peak_sum/ground_sum))
 
 pg.mkQApp()
 win = pg.GraphicsLayoutWidget()
-# win.resize(800, 400)
-win.resize(1366, 768)
+win.resize(400, 300)
 
-plots = []
-i, j = 0, 0
-for n, energySpectrum in enumerate(energySpectrums, 1):
-    counts, energy = energySpectrum
-    p = win.addPlot(col=j, row=i)
-    # p.setTitle(f'Energy spectrum №{n}')
-    # p.setLogMode(y=True)
-    p.setLabel('left', 'Counts')
-    p.setLabel('bottom', f'№{n} Energy', units='eV')
-    p.showGrid(x=True, y=True)
-    p.plot(x=energy, y=counts).setPen((0, 0, 255, 255))
-    plots.append(p)
-    if i < 8 - 1:
-        i += 1
-    else:
-        j += 1
-        i = 0
-
-# p = win.addPlot(title='Energy spectrum')
-# p.plot(x=energySpectrums[0, 1],y=(np.sum(energySpectrums[:, 0], axis=0) + 1)).setPen((0, 0, 255, 255))
-# # p.setLogMode(y=True)
-# p.showGrid(x=True, y=True)
-# p.setLabel('bottom', 'Energy', units='eV')
-# p.setLabel('left', 'Count')
+p = win.addPlot(title='Energy spectrum')
+p.plot(x=energy/eV, y=counts).setPen((0, 0, 255, 255))
+# p.setLogMode(y=True)
+p.showGrid(x=True, y=True)
+p.setLabel('bottom', 'Energy', units='eV')
+p.setLabel('left', 'Count')
 
 win.show()
 QtGui.QApplication.instance().exec_()
