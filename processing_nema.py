@@ -1,102 +1,88 @@
+import re
 from pathlib import Path
 import numpy as np
-from raw_data_processing import DataConverter, DataExtractor, DataSaver
-import pyvista as pv
-from hepunits import*
+from hepunits import *
 
+from raw_data_processing import DataConverter, DataExtractor, DataSaver
 
 if __name__ == '__main__':
-    filename = 'nema1-10'
+    # Базовые настройки папок
+    filename = 'nema_4.2'
+    data_dir = Path(f'Raw data/{filename}')
     
-    views = 40
-    gamma_cameras = 2
+    # 1. АВТООПРЕДЕЛЕНИЕ ФАЙЛОВ
+    # Ищем все файлы с расширением .hdf или .hdf5
+    file_paths = list(data_dir.glob('*.hdf*'))
+    if not file_paths:
+        raise FileNotFoundError(f"В директории {data_dir} не найдено файлов HDF/HDF5!")
+    
+    # Переводим пути в строки для DataExtractor
+    name_list = [str(p) for p in file_paths]
+    print(f"Обнаружено файлов с данными: {len(name_list)}")
 
-    angles = np.linspace(0, 2*pi, views, endpoint=False)[:views//gamma_cameras]
-    name_list = [f'{round(angle/degree, 1)} deg' for angle in angles]
-    name_list = [f'Raw data/{filename}/' + name + '.hdf' for name in name_list]
-
+    # 2. ИЗВЛЕЧЕНИЕ ДАННЫХ
     data_extractor = DataExtractor(max_processes=15, time_interval=[0*s, 15*s])
-    
     data = data_extractor.extract_data(name_list)
 
+    # 3. АВТОМАТИЧЕСКАЯ СБОРКА И СОРТИРОВКА ПРОЕКЦИЙ
     new_data = []
     angles = []
+    
     for volumes in data:
         for volume_name, volume_data in volumes.items():
-            angle = float(volume_name.split(' ')[2])
+            # Умный поиск угла в названии (например, "Detector at 180.0 deg")
+            match = re.search(r'at ([\d\.]+) deg', volume_name)
+            if match:
+                angle = float(match.group(1))
+            else:
+                print(f"Предупреждение: Не удалось извлечь угол из {volume_name}. Пропуск.")
+                continue
+                
             angles.append(angle)
             new_data.append({'interactions_data': volume_data})
-    data = [new_data[i] for i in np.argsort(angles)]
+            
+    # Сортируем все проекции по абсолютному углу поворота
+    sort_indices = np.argsort(angles)
+    data = [new_data[i] for i in sort_indices]
+    sorted_angles = np.array(angles)[sort_indices]
+    
+    # Автоматическое определение количества проекций (views)
+    views = len(data)
+    print(f"Успешно собрано и отсортировано проекций: {views}")
 
+    # 4. НАСТРОЙКИ КОНВЕРТЕРА
     data_converter = DataConverter(max_processes=40)
     data_converter.processing_parameters = {
-            "decay_time": 300 * ns,
-            "spatial_resolution": 4.0 * mm,
-            "energy_resolution": 9.9,
-            "reference_energy": 140.5 * keV,
-            "energy_channels": 1024,
-            "energy_range": [0, 300 * keV],
-            "energy_windows": [
-                # [1.0, [126 * keV, 154 * keV]],
-                # [-0.5, [98 * keV, 126 * keV]],
-                [1.0, [143 * keV, 175 * keV]],
-                # [-0.5, [111 * keV, 143 * keV]],
-                ],
-            "image_range": None,
-            "pixel_size": 2.5 * mm,
-            "matrix": [128, 128],
-            "use_distance_traveled": True,
-            "voxel_size": 4.0 * mm,
-            "emission_ROI": [[-600.0, 600.0 * cm], [-600.0, 600.0 * cm], [-400.0 * cm, 400.0 * cm]],
-        }
+        "decay_time": 300 * ns,
+        "spatial_resolution": 4.0 * mm,
+        "energy_resolution": 9.9,
+        "reference_energy": 140.5 * keV,
+        "energy_channels": 1024,
+        "energy_range": [0, 300 * keV],
+        "energy_windows": [
+            [1.0, [143 * keV, 175 * keV]], # Основное окно (например, I-123 или Tc-99m)
+        ],
+        "image_range": None,
+        "pixel_size": 2.5 * mm,
+        "matrix": [128, 128],
+        "use_distance_traveled": True,
+        "voxel_size": 4.0 * mm,
+        "emission_ROI": [[-600.0, 600.0 * cm], [-600.0, 600.0 * cm], [-400.0 * cm, 400.0 * cm]],
+    }
 
-    if True:
-        images = data_converter.convert_to_image(data)
-        images = np.roll(images, views//2, axis=0)
-        # images = images[::-1]
-        images[images < 0] = 0
- 
-        pixel_size = data_converter.processing_parameters['pixel_size']
-        data_saver = DataSaver(images, filename + "_MEW", pixel_size=pixel_size)
-        data_saver.save_as_numpy(rot=True)
-        data_saver.save_as_dicom()
-        data_saver.save_as_dat()
-        
-        exit()
+    # 5. ГЕНЕРАЦИЯ И СОХРАНЕНИЕ ИЗОБРАЖЕНИЙ (СИНОГРАММЫ)
+    images = data_converter.convert_to_image(data)
     
-    for i, point_cloud in enumerate(data_converter.convert_to_vtk_point_cloud(data), 1):
-        dir = f"VTK data/{filename}_MEW6/"
-        Path(dir).mkdir(parents=True, exist_ok=True)
-        point_cloud.save(dir + f"/proj_processed {i}.vtp")
+    # Сдвигаем массив на половину от автоматически найденного числа проекций
+    images = np.roll(images, views // 2, axis=0)
+    images[images < 0] = 0
+
+    pixel_size = data_converter.processing_parameters['pixel_size']
+    data_saver = DataSaver(images, filename + "_MEW", pixel_size=pixel_size)
     
-    # exit()
+    # Создаем необходимые директории внутри DataSaver (если нужно) или убеждаемся, что они есть
+    data_saver.save_as_numpy(rot=True)
+    data_saver.save_as_dicom()
+    data_saver.save_as_dat()
     
-    data_extractor.translator.update({
-            "particle_ID": "particle_ID",
-            "process_name": "process_name",
-            "scattering_angles": "scattering_angles",
-    })
-    data = data_extractor.extract_data(name_list)
-    
-    new_data = []
-    angles = []
-    for volumes in data:
-        for volume_name, volume_data in volumes.items():
-            angle = float(volume_name.split(' ')[2])
-            angles.append(angle)
-            new_data.append({'interactions_data': volume_data})
-    data = [new_data[i] for i in np.argsort(angles)]
-    
-    for i, dat in enumerate(data, 1):
-        interactions_data = dat["interactions_data"]
-        point_cloud = pv.PolyData(interactions_data["global_position"])
-        for key, value in interactions_data.items():
-            if key == "process_name":
-                process_id = np.zeros_like(value, dtype = int)
-                process_id[value == b"ComptonScattering"] = 1
-                process_id[value == b"CoherentScattering"] = 2
-                point_cloud["process_id"] = process_id
-            point_cloud[key] = value
-        point_cloud.save(f"VTK data/{filename}/proj {i}.vtp")
-        
-    
+    print("Изображения успешно сохранены.")

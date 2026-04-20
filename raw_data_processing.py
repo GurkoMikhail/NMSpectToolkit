@@ -7,6 +7,7 @@ import SimpleITK as sitk
 from h5py import File
 from hepunits import *
 from numba import jit
+from pathlib import Path
 
 
 class DataExtractor:
@@ -18,14 +19,13 @@ class DataExtractor:
             "local_position": "local_position",
             "global_position": "global_position",
             "energy_deposit": "energy_deposit",
-            "emission_time": "emission_time",
-            "emission_energy": "emission_energy",
-            "emission_position": "emission_position",
-            "emission_direction": "emission_direction",
             "distance_traveled": "distance_traveled",
             "particle_ID": "particle_ID",
-            # "process_name": "process_name",
-            # "scattering_angles": "scattering_angles",
+            "process_name": "process_name",
+            "scattering_angles": "scattering_angles",
+            "species": "species",
+            "material_id": "material_id",
+            "volume_id": "volume_id"
         }
 
     def extract_data(self, filepath):
@@ -37,49 +37,91 @@ class DataExtractor:
     def _extract_data(self, filepath):
         filename = filepath.split(sep="/")[-1]
         print(f"Reading {filename}")
-        file = File(filepath, "r")
-        data = self._data_extraction(file)
-        file.close()
+        with File(filepath, "r") as file:
+            data = self._data_extraction(file)
         return data
 
     def _data_extraction(self, file):
         data = {}
-        if False:
-            # if file['Modeling parameters/Subject'] is None:
-            parameters = file["Modeling parameters/Space/Detector"]
-            # detector = Detector(
-            #     position=parameters['local_position'],
-            #     size=parameters['size'],
-            #     euler_angles=parameters['euler_angles'],
-            #     rotation_center=parameters['rotation_center']
-            # )
-        else:
-            data = {}
-            interactions_data = file["interaction_data"]
-            for volume_name, volume_group in interactions_data.items():
-                data.update(
-                    {
-                        volume_name: {
-                            self.translator[key]: np.copy(volume_group[key])
-                            for key in volume_group.keys()
-                            if key in self.translator
-                        }
-                    }
-                )
+        interactions = file.get("interactions")
+        if not interactions:
+            print("Warning: No 'interactions' group found in file.")
+            return data
+
+        initial_states = file.get("initial_states")
+        has_initial = initial_states is not None
+
+        # Подготавливаем индексы для быстрого маппинга данных из initial_states
+        if has_initial:
+            init_pids = initial_states['particle_ID'][:]
+            sort_idx_init = np.argsort(init_pids)
+            sorted_init_pids = init_pids[sort_idx_init]
+
+        for volume_name, volume_group in interactions.items():
+            vol_data = {}
+            for key in volume_group.keys():
+                if key in self.translator:
+                    vol_data[self.translator[key]] = np.copy(volume_group[key])
+                else:
+                    vol_data[key] = np.copy(volume_group[key])
+
+            pids = vol_data.get('particle_ID')
+            n_events = len(pids) if pids is not None else 0
+
+            # 1. Извлекаем начальные состояния, если это HistoryAssemblerHandler
+            if has_initial and pids is not None:
+                idx = np.searchsorted(sorted_init_pids, pids)
+                # Защита от выхода за границы
+                idx = np.clip(idx, 0, len(sorted_init_pids) - 1)
+                valid_mask = (sorted_init_pids[idx] == pids)
+                mapped_idx = sort_idx_init[idx]
+
+                if 'emission_position' in initial_states:
+                    vol_data['emission_position'] = initial_states['emission_position'][:][mapped_idx]
+                    vol_data['emission_position'][~valid_mask] = 0.0
+                if 'emission_direction' in initial_states:
+                    vol_data['emission_direction'] = initial_states['emission_direction'][:][mapped_idx]
+                    vol_data['emission_direction'][~valid_mask] = 0.0
                 
-                if "emission_time" not in data[volume_name]: continue
+                time_key = 'emission_time' if 'emission_time' in initial_states else 'time'
+                if time_key in initial_states:
+                    vol_data['emission_time'] = initial_states[time_key][:][mapped_idx]
+                    vol_data['emission_time'][~valid_mask] = 0.0
                 
-                emission_time = np.copy(data[volume_name]["emission_time"])
-                indices_sort = np.argsort(emission_time)
-                if self.time_interval is not None:
-                    sorted_emission_time = emission_time[indices_sort]
-                    lower_timelimit_index = np.searchsorted(sorted_emission_time, self.time_interval[0], side="left")
-                    upper_timelimit_index = np.searchsorted(sorted_emission_time, self.time_interval[1], side="right")
-                    indices_sort = indices_sort[lower_timelimit_index:upper_timelimit_index]
-                if self.events_limit is not None and indices_sort.size > self.events_limit:
-                    indices_sort = indices_sort[: int(self.events_limit)]
-                for key in data[volume_name].keys():
-                    data[volume_name][key] = data[volume_name][key][indices_sort]
+                energy_key = 'emission_energy' if 'emission_energy' in initial_states else 'energy'
+                if energy_key in initial_states:
+                    vol_data['emission_energy'] = initial_states[energy_key][:][mapped_idx]
+                    vol_data['emission_energy'][~valid_mask] = 0.0
+
+            # 2. Заглушки, если это SensitiveVolumeHandler (без initial_states)
+            if 'emission_time' not in vol_data:
+                vol_data['emission_time'] = np.zeros(n_events, dtype=float)
+            if 'emission_energy' not in vol_data:
+                vol_data['emission_energy'] = np.zeros(n_events, dtype=float)
+            if 'emission_position' not in vol_data:
+                vol_data['emission_position'] = np.zeros((n_events, 3), dtype=float)
+            if 'emission_direction' not in vol_data:
+                vol_data['emission_direction'] = np.zeros((n_events, 3), dtype=float)
+
+            # 3. Сортировка и фильтрация по времени (или по ID частицы)
+            has_real_time = np.any(vol_data['emission_time'] != 0)
+            sort_key = vol_data['emission_time'] if has_real_time else vol_data['particle_ID']
+            indices_sort = np.argsort(sort_key)
+
+            if self.time_interval is not None and has_real_time:
+                sorted_time = vol_data['emission_time'][indices_sort]
+                lower_idx = np.searchsorted(sorted_time, self.time_interval[0], side="left")
+                upper_idx = np.searchsorted(sorted_time, self.time_interval[1], side="right")
+                indices_sort = indices_sort[lower_idx:upper_idx]
+
+            if self.events_limit is not None and indices_sort.size > self.events_limit:
+                indices_sort = indices_sort[: int(self.events_limit)]
+
+            for key in vol_data.keys():
+                vol_data[key] = vol_data[key][indices_sort]
+
+            data[volume_name] = vol_data
+
         return data
 
 
@@ -118,14 +160,39 @@ class DataProcessor:
         emission_direction = data["emission_direction"]
         distance_traveled = data["distance_traveled"]
         particle_ID = data["particle_ID"]
-        if use_distance_traveled:
-            registration_time = emission_time + distance_traveled / c_light
+
+        has_real_time = np.any(emission_time != 0)
+        registration_time = np.zeros_like(particle_ID, dtype=float)
+
+        # Выбираем ключ для группировки актов
+        if has_real_time:
+            registration_time = emission_time + (distance_traveled / c_light if use_distance_traveled else 0)
+            registration_time = self.culc_registration_time(registration_time, decay_time)
+            grouping_key = registration_time
         else:
-            registration_time = emission_time
-        registration_time = self.culc_registration_time(registration_time, decay_time)
-        registration_time, indices, counts = np.unique(registration_time, return_index=True, return_counts=True)
+            # Если времени нет, группируем строго по Particle ID (никаких pile-up)
+            grouping_key = particle_ID
+
+        # Важно: сортируем массивы перед вызовом np.unique, 
+        # иначе np.arange захватит неверные смежные элементы
+        sort_idx = np.argsort(grouping_key)
+        grouping_key = grouping_key[sort_idx]
+        registration_time = registration_time[sort_idx]
+        
+        local_position = local_position[sort_idx]
+        global_position = global_position[sort_idx]
+        energy_deposit = energy_deposit[sort_idx]
+        emission_time = emission_time[sort_idx]
+        emission_energy = emission_energy[sort_idx]
+        emission_position = emission_position[sort_idx]
+        emission_direction = emission_direction[sort_idx]
+        distance_traveled = distance_traveled[sort_idx]
+        particle_ID = particle_ID[sort_idx]
+
+        unique_keys, indices, counts = np.unique(grouping_key, return_index=True, return_counts=True)
         events_number = indices.size
         events_indices = [np.arange(indices[i], indices[i] + counts[i]) for i in range(events_number)]
+        
         averaged_local_position = np.zeros((events_number, 3), dtype=float)
         averaged_global_position = np.zeros((events_number, 3), dtype=float)
         primary_position = np.zeros((events_number, 3), dtype=float)
@@ -136,7 +203,8 @@ class DataProcessor:
         sum_energy_deposit = np.zeros(events_number, dtype=float)
         averaged_emission_position = np.zeros((events_number, 3), dtype=float)
         averaged_emission_direction = np.zeros((events_number, 3), dtype=float)
-        averaged_particle_ID = np.zeros((events_number), dtype=np.uint64)
+        averaged_particle_ID = np.zeros(events_number, dtype=np.uint64)
+        
         del_indices = []
         for i, acts_indices in enumerate(events_indices):
             weights = energy_deposit[acts_indices]
@@ -154,10 +222,10 @@ class DataProcessor:
                 averaged_particle_ID[i] = np.amax(particle_ID[acts_indices])
             else:
                 del_indices.append(i)
+                
         del_indices = np.array(del_indices, dtype=int)
 
-        data["registration_time"] = np.delete(registration_time, del_indices)
-
+        data["registration_time"] = np.delete(unique_keys if has_real_time else registration_time[indices], del_indices)
         data["local_position"] = np.delete(averaged_local_position, del_indices, axis=0)
         data["global_position"] = np.delete(averaged_global_position, del_indices, axis=0)
         data["primary_position"] = np.delete(primary_position, del_indices, axis=0)
@@ -314,6 +382,9 @@ class DataSaver:
                 data = np.rot90(self.data, k=-1, axes=(1, 2))
             else:
                 data = np.rot90(self.data, k=-1)
+                
+        Path("Numpy data").mkdir(parents=True, exist_ok=True)
+        
         np.save(f"Numpy data/{self.filename}.npy", data)
 
     def save_as_dicom(self):
@@ -325,6 +396,7 @@ class DataSaver:
             data = np.rot90(self.data, k=-1)
             data = data[::-1]
         data = data.astype(np.uint16)
+        
         image = sitk.GetImageFromArray(data)
         shape = np.array(data.shape)
         origin = [*((1 - shape) * self.pixel_size / 2), 0.5]
@@ -333,18 +405,21 @@ class DataSaver:
         image.SetSpacing(spacing)
         image.SetMetaData("0010|0010", self.filename)
         image.SetMetaData("0018|0070", str(data.sum()))
+        
+        Path("DICOM data").mkdir(parents=True, exist_ok=True)
+        
         sitk.WriteImage(image, f"DICOM data/{self.filename}.dcm")
 
     def save_as_dat(self):
         print(f"Saving {self.filename} as Dat")
         data = self.data
+        
         if self.data.ndim > 2:
-            from pathlib import Path
-
             Path(f"Dat data/{self.filename}").mkdir(parents=True, exist_ok=True)
             for i, image in enumerate(data, 1):
                 image = image[::-1]
                 np.savetxt(f"Dat data/{self.filename}/{i}.dat", image, fmt="%i", delimiter="\t")
         else:
+            Path("Dat data").mkdir(parents=True, exist_ok=True)
             data = data[::-1]
             np.savetxt(f"Dat data/{self.filename}.dat", data, fmt="%i", delimiter="\t")
