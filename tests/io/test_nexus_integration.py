@@ -110,6 +110,14 @@ def test_simulation_data_extractor_and_exporters(tmp_path: Path) -> None:
         metadata=metadata,
     )
     assert nxs_path.is_file()
+    with h5py.File(nxs_path, "r") as nxs_file:
+        x_coords = np.asarray(nxs_file["/entry/data/x"][()], dtype=np.float64)
+        y_coords = np.asarray(nxs_file["/entry/data/y"][()], dtype=np.float64)
+        expected_coords = (np.arange(16, dtype=np.float64) - 0.5 * 15.0) * 4.2
+        assert np.allclose(x_coords, expected_coords, atol=1e-4)
+        assert np.allclose(y_coords, expected_coords, atol=1e-4)
+        assert np.isclose(float(np.mean(x_coords)), 0.0, atol=1e-5)
+
     summary = inspect_nexus_file(nxs_path)
     assert summary["projections_shape"] == (6, 16, 16)
     assert "primary_fraction" in summary["metrics"]
@@ -130,12 +138,16 @@ def test_simulation_data_extractor_and_exporters(tmp_path: Path) -> None:
     dcm_ds = pydicom.dcmread(dcm_path)
     assert dcm_ds.Modality == "NM"
     assert int(dcm_ds.NumberOfFrames) == 6
+    assert list(dcm_ds.DetectorVector) == [1, 1, 1, 2, 2, 2]
+    assert dcm_ds.RotationInformationSequence[0].RotationDirection == "CCW"
 
     # 3. Экспорт в VTK ParaView (.vtm) с проверкой выбора противоположного ракурса (+180 град) для Detector_2
     projections[0] = 10.0
     projections[1] = 20.0
     projections[3] = 99.0  # Вектор angles=[0, 30, 60, 90, 120, 150] -> ближайший к 180 град ракурс имеет индекс 5 (150 град)
     projections[5] = 77.0
+    projections[5, 0, :] = 15.0
+    projections[5, -1, :] = 85.0
     vtm_path = tmp_path / "study.vtm"
     VtkParaviewExporter(vtm_path).export(
         projections=projections,
@@ -147,13 +159,35 @@ def test_simulation_data_extractor_and_exporters(tmp_path: Path) -> None:
         metadata=metadata,
     )
     assert vtm_path.is_file()
+    det1_vti_path = tmp_path / "study" / "Detector_1_Projection.vti"
     det2_vti_path = tmp_path / "study" / "Detector_2_Projection.vti"
+    col1_vti_path = tmp_path / "study" / "Collimator_1.vti"
+    assert det1_vti_path.is_file()
     assert det2_vti_path.is_file()
+    assert col1_vti_path.is_file()
+
+    reader_det1 = vtk.vtkXMLImageDataReader()
+    reader_det1.SetFileName(str(det1_vti_path))
+    reader_det1.Update()
+    det1_bounds = reader_det1.GetOutput().GetBounds()
+    assert np.isclose(0.5 * (det1_bounds[2] + det1_bounds[3]), 298.6, atol=1e-3)
+
+    reader_col1 = vtk.vtkXMLImageDataReader()
+    reader_col1.SetFileName(str(col1_vti_path))
+    reader_col1.Update()
+    col1_bounds = reader_col1.GetOutput().GetBounds()
+    # Верхняя грань коллиматора 1 должна примыкать к нижней (входной) грани кристалла 1 без пересечения
+    assert np.isclose(col1_bounds[3], det1_bounds[2], atol=1e-3)
+
     reader = vtk.vtkXMLImageDataReader()
     reader.SetFileName(str(det2_vti_path))
     reader.Update()
-    det2_scalars = numpy_support.vtk_to_numpy(reader.GetOutput().GetCellData().GetScalars())
-    assert np.allclose(det2_scalars, 77.0)
+    det2_bounds = reader.GetOutput().GetBounds()
+    assert np.isclose(0.5 * (det2_bounds[2] + det2_bounds[3]), -298.6, atol=1e-3)
+    det2_scalars = numpy_support.vtk_to_numpy(reader.GetOutput().GetCellData().GetScalars()).reshape((16, 16), order="F")
+    # Проверка разворота оси X для противоположного детектора (индекс 0 в мировых X соответствует концу локальной оси X_2)
+    assert np.allclose(det2_scalars[0, :], 85.0)
+    assert np.allclose(det2_scalars[-1, :], 15.0)
 
 
 def test_detector_pose_matrix_and_fail_fast_validation(tmp_path: Path) -> None:
@@ -227,3 +261,71 @@ def test_detector_pose_matrix_and_fail_fast_validation(tmp_path: Path) -> None:
             assert float(np.max(real_acts[:, 3])) <= 270.1 * mm
             assert float(np.min(real_acts[:, 4])) >= -200.1 * mm
             assert float(np.max(real_acts[:, 4])) <= 200.1 * mm
+
+
+def test_causal_scattering_order_by_distance_traveled(tmp_path: Path) -> None:
+    """Проверяет учёт только предшествующих рассеяний (sim_dist < det_dist) при расчёте scattering_order."""
+    hdf_path = tmp_path / "causal_scatter.hdf"
+    sim_pids = np.array([1, 2, 3, 3, 10, 10, 20, 20, 20, 20, 20, 30, 30, 30], dtype=np.uint64)
+    sim_dists = np.array(
+        [100.0, 260.0, 250.0, 270.0, 50.0, 250.0, 30.0, 80.0, 120.0, 310.0, 400.0, 10.0, 90.0, 180.0],
+        dtype=np.float32,
+    )
+    det_pids = np.array([1, 2, 3, 3, 10, 20, 30, 99], dtype=np.uint64)
+    det_dists = np.array([210.0, 200.0, 220.0, 300.0, 150.0, 200.0, 90.0, 100.0], dtype=np.float32)
+
+    with h5py.File(hdf_path, "w") as h5_file:
+        inter_grp = h5_file.create_group("interactions")
+        sim_vol = inter_grp.create_group("Simulation_volume")
+        sim_vol.create_dataset("particle_ID", data=sim_pids)
+        sim_vol.create_dataset("distance_traveled", data=sim_dists)
+        proc_ds = sim_vol.create_dataset("process_code", data=np.ones_like(sim_pids, dtype=np.uint8))
+        proc_ds.attrs["mapping"] = '{"0": "PhotoelectricEffect", "1": "ComptonScattering"}'
+
+        det_grp = inter_grp.create_group("Detector_1")
+        det_grp.create_dataset("particle_ID", data=det_pids)
+        det_grp.create_dataset("distance_traveled", data=det_dists)
+        det_grp.create_dataset(
+            "energy_deposit",
+            data=np.full(det_pids.size, 0.050, dtype=np.float32),
+        )
+        det_grp.create_dataset(
+            "local_position",
+            data=np.zeros((det_pids.size, 3), dtype=np.float32),
+        )
+
+    extractor = SimulationDataExtractor(hdf_path)
+    extractor.extract_data("Detector_1")
+    orders = extractor.get_scattering_orders("Detector_1")
+    expected_orders = [
+        int(np.sum((sim_pids == pid_val) & (sim_dists < dist_val)))
+        for pid_val, dist_val in zip(det_pids, det_dists, strict=True)
+    ]
+    assert list(orders) == expected_orders
+    assert list(orders[:4]) == [1, 0, 0, 2]
+
+    # Проверка DICOM NM при num_frames == 1 и при направлении вращения CW
+    single_dcm_path = tmp_path / "single_frame.dcm"
+    DicomNMExporter(single_dcm_path).export(
+        projections=np.ones((1, 8, 8), dtype=np.float64) * 5.0,
+        angles=np.array([0.0 * deg], dtype=np.float64),
+        pixel_size=4.2 * mm,
+        orbit_radius=250.0 * mm,
+    )
+    single_ds = pydicom.dcmread(single_dcm_path)
+    assert int(single_ds.NumberOfDetectors) == 1
+    assert len(single_ds.DetectorInformationSequence) == 1
+    assert np.atleast_1d(single_ds.DetectorVector).tolist() == [1]
+
+    cw_dcm_path = tmp_path / "cw_frames.dcm"
+    cw_angles = np.array([0.0, 330.0, 300.0, 270.0], dtype=np.float64) * deg
+    DicomNMExporter(cw_dcm_path).export(
+        projections=np.ones((4, 8, 8), dtype=np.float64) * 10.0,
+        angles=cw_angles,
+        pixel_size=4.2 * mm,
+        orbit_radius=250.0 * mm,
+    )
+    cw_ds = pydicom.dcmread(cw_dcm_path)
+    assert int(cw_ds.NumberOfDetectors) == 2
+    assert len(cw_ds.DetectorInformationSequence) == 2
+    assert cw_ds.RotationInformationSequence[0].RotationDirection == "CW"

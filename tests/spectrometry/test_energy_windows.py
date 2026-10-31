@@ -114,3 +114,47 @@ def test_spectrum_processor_three_level_metrics() -> None:
     assert result.scatter_to_primary_ratio >= 0.0
     assert 0.5 < result.photopeak_efficiency <= 1.0
     assert 0.0 <= result.window_purity <= 1.0
+
+    # Проверка корректности морфологической оценки континуума на чистом гауссовом фотопике 140.5 кэВ (без фона)
+    pure_tc_energies = rng.normal(loc=140.5 * keV, scale=5.6 * keV, size=5000)
+    pure_tc_orders = np.zeros(5000, dtype=np.int32)
+    tc_processor = SpectrumProcessor(energy_range=(0.0 * keV, 250.0 * keV), num_bins=1024)
+    tc_window = get_energy_window_preset("peak140", isotope="99mTc")[0]
+    pure_res = tc_processor.analyze(pure_tc_energies, scatter_orders=pure_tc_orders, window_config=tc_window)
+    assert pure_res.window_purity > 0.95
+    assert pure_res.compton_to_primary_ratio < 0.05
+
+    # Проверка учёта вычитания рассеяния DEW/TEW в 6 метриках качества и поддержки мультиоконного пресета dual_peak
+    peak49_events = rng.normal(loc=48.9 * keV, scale=2.0 * keV, size=500)
+    peak75_events = rng.normal(loc=74.6 * keV, scale=2.5 * keV, size=1000)
+    compton_bg = rng.uniform(low=55.0 * keV, high=90.0 * keV, size=700)
+    tb_energies = np.concatenate([peak49_events, peak75_events, compton_bg])
+    tb_orders = np.concatenate([
+        np.zeros(1500, dtype=np.int32),
+        np.full(700, 2, dtype=np.int32),
+    ])
+
+    tb_proc = SpectrumProcessor(energy_range=(0.0 * keV, 300.0 * keV), num_bins=1024)
+    win_no_corr = get_energy_window_preset("peak75", isotope="161Tb")[0]
+    win_tew = get_energy_window_preset("peak75_tew", isotope="161Tb")[0]
+    wins_dual = get_energy_window_preset("dual_peak", isotope="161Tb")
+
+    res_no_corr = tb_proc.analyze(tb_energies, scatter_orders=tb_orders, window_config=win_no_corr)
+    res_tew = tb_proc.analyze(tb_energies, scatter_orders=tb_orders, window_config=win_tew)
+    res_dual = tb_proc.analyze(tb_energies, scatter_orders=tb_orders, window_config=wins_dual)
+
+    assert res_tew.primary_fraction > res_no_corr.primary_fraction
+    assert res_tew.scatter_to_primary_ratio < res_no_corr.scatter_to_primary_ratio
+    assert res_tew.mean_scatter_order < res_no_corr.mean_scatter_order
+    assert res_dual.photopeak_efficiency > res_no_corr.photopeak_efficiency
+
+    # Проверка защиты кэша SpectrumProcessor от внешних и in-place мутаций массивов
+    original_total_sum = float(np.sum(res_no_corr.total_spectrum))
+    res_no_corr.total_spectrum[:] = 0.0
+    res_cached = tb_proc.analyze(tb_energies, scatter_orders=tb_orders, window_config=win_no_corr)
+    assert np.isclose(float(np.sum(res_cached.total_spectrum)), original_total_sum)
+
+    tb_energies[0] = 295.0 * keV
+    tb_orders[0] = 5
+    res_after_inplace = tb_proc.analyze(tb_energies, scatter_orders=tb_orders, window_config=win_no_corr)
+    assert not np.array_equal(res_after_inplace.scatter_spectrum, res_cached.scatter_spectrum)

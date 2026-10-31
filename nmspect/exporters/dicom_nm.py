@@ -89,11 +89,15 @@ class DicomNMExporter:
             pixel_array = np.round(clipped_proj).astype(np.uint16)
             rescale_slope = 1.0
 
-        converted_angles = angles_arr / deg
+        converted_angles = np.mod(angles_arr / deg, 360.0)
         start_angle = float(converted_angles[0]) if converted_angles.size > 0 else 0.0
-        angular_step = (
-            float(converted_angles[1] - converted_angles[0]) if converted_angles.size > 1 else 3.0
-        )
+        if converted_angles.size > 1:
+            wrapped_diffs = ((np.diff(converted_angles) + 180.0) % 360.0) - 180.0
+            non_zero_diffs = wrapped_diffs[np.abs(wrapped_diffs) > 1e-6]
+            signed_step = float(np.median(non_zero_diffs)) if non_zero_diffs.size > 0 else 0.0
+        else:
+            signed_step = 3.0
+        angular_step = abs(signed_step) if abs(signed_step) > 1e-6 else 3.0
         converted_pixel_size = float(pixel_size / mm)
         resolved_orbit = float(meta_dict.get("orbit_radius", orbit_radius) / mm)
 
@@ -112,8 +116,6 @@ class DicomNMExporter:
         file_meta.ImplementationVersionName = "NMSPECT_0.2"
 
         dicom_ds = FileDataset(str(target_path), {}, file_meta=file_meta, preamble=b"\0" * 128)
-        dicom_ds.is_little_endian = True
-        dicom_ds.is_implicit_VR = False
 
         # Patient Module
         dicom_ds.PatientName = str(meta_dict.get("patient_name", "PHANTOM^NEMA IEC"))
@@ -183,9 +185,14 @@ class DicomNMExporter:
         dicom_ds.FrameIncrementPointer = [0x00540050, 0x00540090]
         dicom_ds.EnergyWindowVector = [1] * num_frames
         dicom_ds.NumberOfEnergyWindows = 1
-        default_detectors = [1 if (frame_idx % 2 == 0) else 2 for frame_idx in range(num_frames)]
-        dicom_ds.DetectorVector = list(meta_dict.get("detector_vector", default_detectors))
-        dicom_ds.NumberOfDetectors = 2
+        half_frames = max(1, num_frames // 2)
+        default_detectors = [1 if frame_idx < half_frames else 2 for frame_idx in range(num_frames)]
+        detector_vector = [
+            int(det_id) for det_id in meta_dict.get("detector_vector", default_detectors)
+        ]
+        num_detectors = max(detector_vector) if detector_vector else 1
+        dicom_ds.DetectorVector = detector_vector
+        dicom_ds.NumberOfDetectors = num_detectors
         dicom_ds.PhaseVector = [1] * num_frames
         dicom_ds.NumberOfPhases = 1
         dicom_ds.RotationVector = [1] * num_frames
@@ -199,7 +206,7 @@ class DicomNMExporter:
 
         # NM Detector Module
         detector_info_seq = DicomSequence()
-        for _ in range(1, 3):
+        for _ in range(num_detectors):
             det_item = Dataset()
             det_item.CollimatorGridName = str(meta_dict.get("collimator_grid", "LEHR"))
             det_item.CollimatorType = "PARA"
@@ -214,11 +221,20 @@ class DicomNMExporter:
         dicom_ds.DetectorInformationSequence = detector_info_seq
 
         # NM TOMO Acquisition Module
+        gantry_meta = meta_dict.get("gantry", {})
+        default_rot_dir = "CCW" if signed_step >= 0.0 else "CW"
+        raw_rot_dir = meta_dict.get(
+            "rotation_direction",
+            gantry_meta.get("rotation_direction", default_rot_dir)
+            if isinstance(gantry_meta, dict)
+            else default_rot_dir,
+        )
+        rot_dir_str = str(raw_rot_dir).strip().upper()
         tomo_rot_seq = DicomSequence()
         rot_item = Dataset()
         rot_item.StartAngle = start_angle
         rot_item.AngularStep = angular_step
-        rot_item.RotationDirection = "CW"
+        rot_item.RotationDirection = rot_dir_str if rot_dir_str in ("CW", "CCW") else default_rot_dir
         rot_item.ScanArc = 360.0
         rot_item.TypeOfDetectorMotion = "STEP AND SHOOT"
         rot_item.RadialPosition = [resolved_orbit] * num_frames
@@ -274,5 +290,5 @@ class DicomNMExporter:
         dicom_ds.SOPInstanceUID = sop_instance_uid
         dicom_ds.PixelData = pixel_array.tobytes()
 
-        dicom_ds.save_as(str(target_path), write_like_original=False)
+        dicom_ds.save_as(str(target_path), enforce_file_format=True)
         return target_path

@@ -85,10 +85,35 @@ class ScintillationProcessor:
         else:
             orders_arr = np.zeros(num_acts, dtype=np.int32)
 
-        # Лексикографическая сортировка по (particle_id, time)
-        sort_indices = np.lexsort((acts_arr[:, 1], acts_arr[:, 0]))
-        sorted_acts = acts_arr[sort_indices]
-        sorted_orders = orders_arr[sort_indices]
+        # Отбрасывание микроскопических актов без энерговыделения (например, упругого когерентного рассеяния в кристалле)
+        positive_energy_mask = acts_arr[:, 2] > 0.0
+        if not np.any(positive_energy_mask):
+            return np.empty((0, 5), dtype=np.float64), np.empty(0, dtype=np.int32)
+
+        if np.all(positive_energy_mask):
+            filtered_acts = acts_arr
+            filtered_orders = orders_arr
+        else:
+            filtered_acts = acts_arr[positive_energy_mask]
+            filtered_orders = orders_arr[positive_energy_mask]
+
+        # Лексикографическая сортировка по (particle_id, time) с быстрой проверкой упорядоченности O(N)
+        pids_col = filtered_acts[:, 0]
+        times_col = filtered_acts[:, 1]
+        is_already_sorted = bool(
+            filtered_acts.shape[0] <= 1
+            or np.all(
+                (pids_col[1:] > pids_col[:-1])
+                | ((pids_col[1:] == pids_col[:-1]) & (times_col[1:] >= times_col[:-1]))
+            )
+        )
+        if is_already_sorted:
+            sorted_acts = filtered_acts
+            sorted_orders = filtered_orders
+        else:
+            sort_indices = np.lexsort((times_col, pids_col))
+            sorted_acts = filtered_acts[sort_indices]
+            sorted_orders = filtered_orders[sort_indices]
 
         pid_changed = sorted_acts[1:, 0] != sorted_acts[:-1, 0]
         if self.time_resolution > 0.0:
@@ -119,6 +144,33 @@ class ScintillationProcessor:
         events_matrix = np.column_stack((event_pids, event_times, valid_energies, event_x, event_y))
         return events_matrix, united_orders[valid_mask]
 
+    def _smear_energy_inplace(self, events_matrix: NDArray[np.float64]) -> None:
+        """Модифицирует столбец энергии (индекс 2) матрицы вспышек `(M, 5)` на месте."""
+        if events_matrix.size == 0 or self.energy_resolution == 0.0:
+            return
+        if events_matrix.ndim != 2 or events_matrix.shape[1] < 5:
+            raise ValueError(f"Матрица events должна иметь форму (M, 5), получено: {events_matrix.shape}")
+
+        relative_fwhm_ref = (
+            self.energy_resolution / 100.0 if self.energy_resolution > 1.0 else self.energy_resolution
+        )
+        energies = np.clip(events_matrix[:, 2], 0.0, None)
+        fwhm_values = relative_fwhm_ref * np.sqrt(self.reference_energy * energies)
+        sigma_values = fwhm_values / _FWHM_TO_SIGMA
+
+        smeared_energies = self.rng.normal(loc=energies, scale=sigma_values)
+        events_matrix[:, 2] = np.clip(smeared_energies, 0.0, None)
+
+    def _smear_spatial_inplace(self, events_matrix: NDArray[np.float64]) -> None:
+        """Модифицирует столбцы локальных координат (индексы 3 и 4) матрицы вспышек `(M, 5)` на месте."""
+        if events_matrix.size == 0 or self.intrinsic_spatial_resolution == 0.0:
+            return
+        if events_matrix.ndim != 2 or events_matrix.shape[1] < 5:
+            raise ValueError(f"Матрица events должна иметь форму (M, 5), получено: {events_matrix.shape}")
+
+        sigma_spatial = self.intrinsic_spatial_resolution / _FWHM_TO_SIGMA
+        events_matrix[:, 3:5] = self.rng.normal(loc=events_matrix[:, 3:5], scale=sigma_spatial)
+
     def apply_energy_resolution(self, events: NDArray[np.float64]) -> NDArray[np.float64]:
         r"""Накладывает стохастическое гауссово размытие энергии сцинтилляционных вспышек ($\sigma_E \propto \sqrt{E}$).
 
@@ -129,20 +181,7 @@ class ScintillationProcessor:
             Копия матрицы вспышек `(M, 5)` с размытыми значениями энергии в столбце 2.
         """
         result = np.array(events, dtype=np.float64, copy=True)
-        if result.size == 0 or self.energy_resolution == 0.0:
-            return result
-        if result.ndim != 2 or result.shape[1] < 5:
-            raise ValueError(f"Матрица events должна иметь форму (M, 5), получено: {result.shape}")
-
-        relative_fwhm_ref = (
-            self.energy_resolution / 100.0 if self.energy_resolution > 1.0 else self.energy_resolution
-        )
-        energies = np.clip(result[:, 2], 0.0, None)
-        fwhm_values = relative_fwhm_ref * np.sqrt(self.reference_energy * energies)
-        sigma_values = fwhm_values / _FWHM_TO_SIGMA
-
-        smeared_energies = self.rng.normal(loc=energies, scale=sigma_values)
-        result[:, 2] = np.clip(smeared_energies, 0.0, None)
+        self._smear_energy_inplace(result)
         return result
 
     def apply_spatial_resolution(self, events: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -155,13 +194,7 @@ class ScintillationProcessor:
             Копия матрицы вспышек `(M, 5)` с размытыми координатами в столбцах 3 и 4.
         """
         result = np.array(events, dtype=np.float64, copy=True)
-        if result.size == 0 or self.intrinsic_spatial_resolution == 0.0:
-            return result
-        if result.ndim != 2 or result.shape[1] < 5:
-            raise ValueError(f"Матрица events должна иметь форму (M, 5), получено: {result.shape}")
-
-        sigma_spatial = self.intrinsic_spatial_resolution / _FWHM_TO_SIGMA
-        result[:, 3:5] = self.rng.normal(loc=result[:, 3:5], scale=sigma_spatial)
+        self._smear_spatial_inplace(result)
         return result
 
     def process_detector_acts(
@@ -185,6 +218,6 @@ class ScintillationProcessor:
         if united_events.shape[0] == 0:
             return united_events, united_orders
 
-        energy_smeared = self.apply_energy_resolution(united_events)
-        processed_events = self.apply_spatial_resolution(energy_smeared)
-        return processed_events, united_orders
+        self._smear_energy_inplace(united_events)
+        self._smear_spatial_inplace(united_events)
+        return united_events, united_orders

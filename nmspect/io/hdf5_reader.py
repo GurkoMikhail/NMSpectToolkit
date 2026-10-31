@@ -122,6 +122,18 @@ class SimulationDataExtractor:
 
         self.file_path: Path = resolved_path
         self.scattering_orders: dict[str, NDArray[np.int32]] = {}
+        self._metadata_cache: dict[str, Any] | None = None
+        self._detectors_names_cache: list[str] | None = None
+        self._init_states_loaded: bool = False
+        self._sorted_init_pids: NDArray[Any] | None = None
+        self._sorted_init_times: NDArray[np.float64] | None = None
+        self._sim_volume_loaded: bool = False
+        self._sim_unique_pids: NDArray[Any] | None = None
+        self._sim_run_starts: NDArray[np.intp] | None = None
+        self._sim_run_counts: NDArray[np.int32] | None = None
+        self._sim_min_dists: NDArray[np.float64] | None = None
+        self._sim_max_dists: NDArray[np.float64] | None = None
+        self._sim_sorted_dists: NDArray[np.float64] | None = None
         clear_hdf5_status_flags_if_needed(self.file_path)
 
     @staticmethod
@@ -151,6 +163,9 @@ class SimulationDataExtractor:
         Returns:
             Список строковых идентификаторов детекторов (например, ['Detector_1', 'Detector_2']).
         """
+        if self._detectors_names_cache is not None:
+            return list(self._detectors_names_cache)
+
         excluded_names = {"Simulation_volume", "Phantom", "metadata", "initial_states", "interactions"}
         detector_names: list[str] = []
 
@@ -166,7 +181,8 @@ class SimulationDataExtractor:
                 if isinstance(group_obj, h5py.Group):
                     detector_names.append(str(group_name))
 
-        return sorted(detector_names)
+        self._detectors_names_cache = sorted(detector_names)
+        return list(self._detectors_names_cache)
 
     def get_detectors_angles(self) -> list[float]:
         """Возвращает углы поворота всех детекторов в базовых единицах hepunits (радианах).
@@ -278,6 +294,9 @@ class SimulationDataExtractor:
         Returns:
             Словарь с разделами 'gantry', 'geometry', 'source', 'simulation', 'protocol', 'volume_matrices'.
         """
+        if self._metadata_cache is not None:
+            return self._metadata_cache
+
         metadata: dict[str, Any] = {
             "gantry": {},
             "geometry": {},
@@ -289,6 +308,7 @@ class SimulationDataExtractor:
 
         with h5py.File(self.file_path, "r") as h5_file:
             if "metadata" not in h5_file or not isinstance(h5_file["metadata"], h5py.Group):
+                self._metadata_cache = metadata
                 return metadata
 
             meta_group = h5_file["metadata"]
@@ -322,7 +342,151 @@ class SimulationDataExtractor:
                                 vol_obj["global_matrix"][()], dtype=np.float64
                             )
 
+        self._metadata_cache = metadata
         return metadata
+
+    def _ensure_initial_states_loaded(self, h5_file: h5py.File) -> None:
+        """Однократно считывает и индексирует таблицу начальных состояний частиц из HDF5."""
+        if self._init_states_loaded:
+            return
+        self._init_states_loaded = True
+
+        if "initial_states" not in h5_file or not isinstance(h5_file["initial_states"], h5py.Group):
+            return
+
+        init_grp = h5_file["initial_states"]
+        init_pid_key = "particle_ID" if "particle_ID" in init_grp else "particle_id"
+        init_time_key = "emission_time" if "emission_time" in init_grp else "time"
+        if init_pid_key not in init_grp or init_time_key not in init_grp:
+            return
+
+        init_pids = self._read_dataset_array(init_grp[init_pid_key]).ravel()
+        init_times = np.asarray(self._read_dataset_array(init_grp[init_time_key]), dtype=np.float64).ravel()
+        if init_pids.size > 0:
+            sort_order = np.argsort(init_pids)
+            self._sorted_init_pids = init_pids[sort_order]
+            self._sorted_init_times = init_times[sort_order]
+
+    def _ensure_sim_volume_loaded(self, interactions_grp: h5py.Group | None) -> None:
+        """Однократно считывает и индексирует акты рассеяния в объёме фантома (`Simulation_volume`)."""
+        if self._sim_volume_loaded:
+            return
+        self._sim_volume_loaded = True
+
+        if interactions_grp is None or "Simulation_volume" not in interactions_grp:
+            return
+
+        sim_vol_grp = interactions_grp["Simulation_volume"]
+        if not isinstance(sim_vol_grp, h5py.Group):
+            return
+
+        sim_pid_key = "particle_ID" if "particle_ID" in sim_vol_grp else "particle_id"
+        if sim_pid_key not in sim_vol_grp:
+            return
+
+        sim_pids = self._read_dataset_array(sim_vol_grp[sim_pid_key]).ravel()
+        sim_distances: NDArray[np.float64] | None = None
+        if "distance_traveled" in sim_vol_grp:
+            sim_distances = np.asarray(
+                self._read_dataset_array(sim_vol_grp["distance_traveled"]), dtype=np.float64
+            ).ravel()
+
+        if "process_code" in sim_vol_grp:
+            proc_ds = sim_vol_grp["process_code"]
+            proc_codes = self._read_dataset_array(proc_ds).ravel()
+            raw_mapping = _convert_hdf5_value(proc_ds.attrs.get("mapping", "{}"))
+            compton_codes: list[int] = []
+            if isinstance(raw_mapping, str) and raw_mapping.startswith("{"):
+                parsed_map = json.loads(raw_mapping)
+                for code_str, proc_name in parsed_map.items():
+                    if "compton" in str(proc_name).lower() or "scatter" in str(proc_name).lower():
+                        compton_codes.append(int(code_str))
+            if compton_codes:
+                min_sim_len = min(sim_pids.size, proc_codes.size)
+                if sim_distances is not None:
+                    min_sim_len = min(min_sim_len, sim_distances.size)
+                valid_scatter = np.isin(proc_codes[:min_sim_len], compton_codes)
+                sim_pids = sim_pids[:min_sim_len][valid_scatter]
+                if sim_distances is not None:
+                    sim_distances = sim_distances[:min_sim_len][valid_scatter]
+
+        if sim_pids.size == 0:
+            return
+
+        if sim_distances is not None and sim_distances.size == sim_pids.size:
+            sort_idx = np.argsort(sim_pids)
+            sorted_pids = sim_pids[sort_idx]
+            sorted_dists = sim_distances[sort_idx]
+
+            run_change = np.empty(sorted_pids.size, dtype=np.bool_)
+            run_change[0] = True
+            run_change[1:] = sorted_pids[1:] != sorted_pids[:-1]
+            run_starts = np.flatnonzero(run_change)
+
+            run_ends = np.empty_like(run_starts)
+            run_ends[:-1] = run_starts[1:]
+            run_ends[-1] = sorted_pids.size
+
+            self._sim_unique_pids = sorted_pids[run_starts]
+            self._sim_run_starts = run_starts
+            self._sim_run_counts = (run_ends - run_starts).astype(np.int32)
+            self._sim_min_dists = np.minimum.reduceat(sorted_dists, run_starts)
+            self._sim_max_dists = np.maximum.reduceat(sorted_dists, run_starts)
+            self._sim_sorted_dists = sorted_dists
+        else:
+            unique_sim_pids, sim_counts = np.unique(sim_pids, return_counts=True)
+            self._sim_unique_pids = unique_sim_pids
+            self._sim_run_counts = sim_counts.astype(np.int32)
+
+    def _compute_scatter_orders(
+        self,
+        raw_pids: NDArray[Any],
+        det_distances: NDArray[np.float64] | None,
+    ) -> NDArray[np.int32]:
+        """Вычисляет кратность предварительного рассеяния для каждого акта в детекторе."""
+        num_acts = raw_pids.size
+        if self._sim_unique_pids is None or self._sim_run_counts is None or self._sim_unique_pids.size == 0:
+            return np.zeros(num_acts, dtype=np.int32)
+
+        pos_idx = np.searchsorted(self._sim_unique_pids, raw_pids)
+        pos_idx = np.clip(pos_idx, 0, self._sim_unique_pids.size - 1)
+        matched_sim = self._sim_unique_pids[pos_idx] == raw_pids
+
+        if (
+            det_distances is not None
+            and self._sim_sorted_dists is not None
+            and self._sim_run_starts is not None
+            and self._sim_min_dists is not None
+            and self._sim_max_dists is not None
+        ):
+            all_before = matched_sim & (self._sim_max_dists[pos_idx] < det_distances)
+            scatter_orders = np.where(all_before, self._sim_run_counts[pos_idx], 0).astype(np.int32)
+
+            ambiguous_mask = (
+                matched_sim
+                & (~all_before)
+                & (self._sim_min_dists[pos_idx] < det_distances)
+            )
+            if np.any(ambiguous_mask):
+                amb_indices = np.flatnonzero(ambiguous_mask)
+                amb_pos = pos_idx[amb_indices]
+                amb_starts = self._sim_run_starts[amb_pos]
+                amb_counts = self._sim_run_counts[amb_pos]
+                amb_det_dists = det_distances[amb_indices]
+
+                total_amb_events = int(np.sum(amb_counts))
+                if total_amb_events > 0:
+                    group_starts = np.cumsum(amb_counts) - amb_counts
+                    flat_sim_idx = np.arange(total_amb_events, dtype=np.intp) + np.repeat(
+                        amb_starts - group_starts, amb_counts
+                    )
+                    repeated_det_dists = np.repeat(amb_det_dists, amb_counts)
+                    is_prior = (self._sim_sorted_dists[flat_sim_idx] < repeated_det_dists).astype(np.int32)
+                    scatter_orders[amb_indices] = np.add.reduceat(is_prior, group_starts)
+
+            return scatter_orders
+
+        return np.where(matched_sim, self._sim_run_counts[pos_idx], 0).astype(np.int32)
 
     def extract_data(self, detector_name: str) -> NDArray[np.float64]:
         """Извлекает матрицу микроскопических актов взаимодействия `(N, 5)` и сохраняет кратности рассеяния.
@@ -378,11 +542,11 @@ class SimulationDataExtractor:
                 global_pos = np.asarray(self._read_dataset_array(det_group["global_position"]), dtype=np.float64)
                 pose_matrix = self._find_pose_matrix(detector_name, metadata)
                 if pose_matrix is not None:
-                    rotation = pose_matrix[:3, :3]
+                    rotation_xy = pose_matrix[:3, :2]
                     translation = pose_matrix[:3, 3]
-                    local_pos = (global_pos - translation) @ rotation
+                    local_pos = (global_pos - translation) @ rotation_xy
                 else:
-                    local_pos = global_pos
+                    local_pos = global_pos[:, :2]
                 local_x = local_pos[:, 0] * mm
                 local_y = local_pos[:, 1] * mm
             else:
@@ -413,69 +577,35 @@ class SimulationDataExtractor:
                 act_times = (
                     np.asarray(self._read_dataset_array(det_group["emission_time"])[:num_acts], dtype=np.float64) * ns
                 )
-            elif "initial_states" in h5_file and isinstance(h5_file["initial_states"], h5py.Group):
-                init_grp = h5_file["initial_states"]
-                init_pid_key = "particle_ID" if "particle_ID" in init_grp else "particle_id"
-                init_time_key = "emission_time" if "emission_time" in init_grp else "time"
-                if init_pid_key in init_grp and init_time_key in init_grp:
-                    init_pids = self._read_dataset_array(init_grp[init_pid_key]).ravel()
-                    init_times = np.asarray(self._read_dataset_array(init_grp[init_time_key]), dtype=np.float64).ravel()
-                    if init_pids.size > 0:
-                        sort_order = np.argsort(init_pids)
-                        sorted_init_pids = init_pids[sort_order]
-                        found_idx = np.searchsorted(sorted_init_pids, raw_pids)
-                        found_idx = np.clip(found_idx, 0, sorted_init_pids.size - 1)
-                        matched_mask = sorted_init_pids[found_idx] == raw_pids
-                        mapped_indices = sort_order[found_idx]
-                        act_times = np.where(matched_mask, init_times[mapped_indices], 0.0) * ns
-                    else:
-                        act_times = np.zeros(num_acts, dtype=np.float64)
+            else:
+                self._ensure_initial_states_loaded(h5_file)
+                if self._sorted_init_pids is not None and self._sorted_init_times is not None:
+                    found_idx = np.searchsorted(self._sorted_init_pids, raw_pids)
+                    found_idx = np.clip(found_idx, 0, self._sorted_init_pids.size - 1)
+                    matched_mask = self._sorted_init_pids[found_idx] == raw_pids
+                    act_times = np.where(matched_mask, self._sorted_init_times[found_idx], 0.0) * ns
                 else:
                     act_times = np.zeros(num_acts, dtype=np.float64)
-            else:
-                act_times = np.zeros(num_acts, dtype=np.float64)
 
+            det_distances: NDArray[np.float64] | None = None
             if "distance_traveled" in det_group:
-                distances = np.asarray(
+                det_distances = np.asarray(
                     self._read_dataset_array(det_group["distance_traveled"])[:num_acts], dtype=np.float64
                 )
-                act_times = act_times + (distances * mm) / c_light
+                act_times = act_times + (det_distances * mm) / c_light
 
-            # Расчёт кратности предварительного комптоновского рассеяния в фантоме (Simulation_volume)
-            scatter_orders = np.zeros(num_acts, dtype=np.int32)
+            # Расчёт кратности предварительного рассеяния до каждого акта взаимодействия в кристалле
+            scatter_orders: NDArray[np.int32] | None = None
             for order_key in ("scattering_order", "scattering_orders", "scatter_order"):
                 if order_key in det_group:
                     scatter_orders = np.asarray(
                         self._read_dataset_array(det_group[order_key])[:num_acts], dtype=np.int32
                     ).ravel()
                     break
-            else:
-                if interactions_grp is not None and "Simulation_volume" in interactions_grp:
-                    sim_vol_grp = interactions_grp["Simulation_volume"]
-                    sim_pid_key = "particle_ID" if "particle_ID" in sim_vol_grp else "particle_id"
-                    if isinstance(sim_vol_grp, h5py.Group) and sim_pid_key in sim_vol_grp:
-                        sim_pids = self._read_dataset_array(sim_vol_grp[sim_pid_key]).ravel()
-                        if "process_code" in sim_vol_grp:
-                            proc_ds = sim_vol_grp["process_code"]
-                            proc_codes = self._read_dataset_array(proc_ds).ravel()
-                            raw_mapping = _convert_hdf5_value(proc_ds.attrs.get("mapping", "{}"))
-                            compton_codes: list[int] = []
-                            if isinstance(raw_mapping, str) and raw_mapping.startswith("{"):
-                                parsed_map = json.loads(raw_mapping)
-                                for code_str, proc_name in parsed_map.items():
-                                    if "compton" in str(proc_name).lower() or "scatter" in str(proc_name).lower():
-                                        compton_codes.append(int(code_str))
-                            if compton_codes:
-                                min_sim_len = min(sim_pids.size, proc_codes.size)
-                                valid_scatter = np.isin(proc_codes[:min_sim_len], compton_codes)
-                                sim_pids = sim_pids[:min_sim_len][valid_scatter]
 
-                        if sim_pids.size > 0:
-                            unique_sim_pids, sim_counts = np.unique(sim_pids, return_counts=True)
-                            pos_idx = np.searchsorted(unique_sim_pids, raw_pids)
-                            pos_idx = np.clip(pos_idx, 0, unique_sim_pids.size - 1)
-                            matched_sim = unique_sim_pids[pos_idx] == raw_pids
-                            scatter_orders = np.where(matched_sim, sim_counts[pos_idx], 0).astype(np.int32)
+            if scatter_orders is None:
+                self._ensure_sim_volume_loaded(interactions_grp)
+                scatter_orders = self._compute_scatter_orders(raw_pids, det_distances)
 
         self.scattering_orders[detector_name] = scatter_orders
         acts_matrix = np.column_stack(

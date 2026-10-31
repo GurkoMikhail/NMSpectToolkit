@@ -206,6 +206,31 @@ class FBPReconstructor:
             )
         return None
 
+    @staticmethod
+    def _compute_backprojection_scale(norm_angles: NDArray[np.float64]) -> float:
+        """
+        Вычисляет нормировочный множитель квадратуры обратного преобразования Радона
+        с учётом фактического углового шага `angular_step` и кратности углового обзора
+        (`0.25 * angular_step` при полном двухстороннем обзоре `2*pi` и `0.5 * angular_step`
+        при односторонней полуорбите `pi`).
+        """
+        num_views = int(norm_angles.size)
+        if num_views <= 1:
+            return float(np.pi / 2.0)
+
+        sorted_angles = np.sort(np.mod(norm_angles, 2.0 * np.pi))
+        diffs = np.diff(sorted_angles)
+        positive_diffs = diffs[diffs > 1e-6]
+        if positive_diffs.size == 0:
+            return float(np.pi / (2.0 * float(num_views)))
+
+        angular_step = float(np.median(positive_diffs))
+        total_span = float(sorted_angles[-1] - sorted_angles[0]) + angular_step
+        # При охвате > pi каждый луч измеряется с двух противоположных направлений (множитель 1/2 в интеграле Радона)
+        if total_span > np.pi + 0.5 * angular_step:
+            return 0.25 * angular_step
+        return 0.5 * angular_step
+
     def reconstruct_with_metadata(
         self,
         projections: NDArray[np.float64],
@@ -232,6 +257,7 @@ class FBPReconstructor:
         num_views = int(proj_arr.shape[0])
         active_voxel_size = float(voxel_size) if voxel_size is not None else self.voxel_size
         norm_angles = normalize_projection_angles(angles, num_views)
+        bp_scale = self._compute_backprojection_scale(norm_angles)
 
         # 1. Частотная фильтрация проекций и классическая обратная проекция
         filtered_proj = self.filter_projections(proj_arr)
@@ -242,7 +268,7 @@ class FBPReconstructor:
             voxel_size=active_voxel_size,
             apply_fov_mask=self.apply_fov_mask,
         )
-        volume = raw_backproj * (np.pi / (2.0 * float(num_views)))
+        volume = raw_backproj * bp_scale
 
         # 2. Коррекция затухания по методу Чанга (1-го или итеративного порядка)
         resolved_att = self._resolve_attenuation_map(
@@ -276,7 +302,7 @@ class FBPReconstructor:
                     attenuation_map=None,
                     voxel_size=active_voxel_size,
                     apply_fov_mask=self.apply_fov_mask,
-                ) * (np.pi / (2.0 * float(num_views)))
+                ) * bp_scale
                 safe_div = np.maximum(correction_map, 1e-3)
                 delta = np.where(correction_map > 1e-3, res_backproj / safe_div, 0.0)
                 volume = volume + delta

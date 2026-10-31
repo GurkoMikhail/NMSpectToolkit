@@ -13,8 +13,8 @@ from nmspect.detector import (
     ScintillationProcessor,
     generate_projections_from_events,
 )
-from nmspect.pipelines import run_isotope_nema_pipeline
-from nmspect.spectrometry import get_energy_window_preset
+from nmspect.pipelines import DEFAULT_REFERENCE_ENERGIES, run_isotope_nema_pipeline
+from nmspect.spectrometry import TC99M_PEAK_140, get_energy_window_preset
 
 
 def test_scintillation_processor_vectorized_unite_acts() -> None:
@@ -114,16 +114,19 @@ def test_end_to_end_isotope_nema_pipeline(tmp_path: Path) -> None:
             geom_grp = meta_grp.create_group("geometry")
             geom_grp.attrs["crystal_dimensions"] = np.array([128.0, 128.0, 9.5], dtype=np.float64)
 
+    assert np.isclose(DEFAULT_REFERENCE_ENERGIES["161Tb"], TC99M_PEAK_140)
+
     exported_tb = run_isotope_nema_pipeline(
         isotope="161Tb",
         data_dir=raw_dir,
-        preset_keys=["peak75"],
+        preset_keys=["peak75", "dual_peak"],
         pixel_size=8.0 * mm,
         output_root=out_dir,
         export_legacy_formats=True,
         rng_seed=42,
     )
     assert "peak75" in exported_tb
+    assert "dual_peak" in exported_tb
     assert exported_tb["peak75"]["nexus"].is_file()
     assert exported_tb["peak75"]["dicom"].is_file()
     assert exported_tb["peak75"]["paraview"].is_file()

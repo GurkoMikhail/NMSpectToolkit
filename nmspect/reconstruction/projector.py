@@ -19,6 +19,8 @@ from dataclasses import dataclass
 import numpy as np
 from hepunits import deg, mm, rad
 from numpy.typing import NDArray
+from scipy.ndimage import gaussian_filter1d
+from scipy.sparse import csr_matrix
 
 
 def normalize_projection_angles(
@@ -111,14 +113,16 @@ def gaussian_smooth_volume(
     volume: NDArray[np.float64],
     fwhm: float,
     voxel_size: float,
+    axes: Sequence[int] | None = None,
 ) -> NDArray[np.float64]:
     """
-    Выполняет сепарабельную 2D или 3D гауссову фильтрацию объёма с шириной
+    Выполняет сепарабельную самосопряжённую гауссову фильтрацию массива с шириной
     на полувысоте `fwhm` (в единицах `hepunits`).
 
-    :param volume: Реконструированный 2D срез `(nx, nx)` или 3D объём `(nx, nx, ny)`.
+    :param volume: Входной массив (например, 2D срез `(nx, nx)`, 3D объём `(nx, nx, ny)` или стек проекций).
     :param fwhm: Ширина гауссианы на полувысоте (FWHM) в системе `hepunits`.
     :param voxel_size: Физический размер вокселя в системе `hepunits`.
+    :param axes: Опциональная последовательность осей, вдоль которых выполняется сглаживание (по умолчанию все оси).
     :return: Сглаженный массив той же формы.
     """
     fwhm_val = float(fwhm)
@@ -135,21 +139,20 @@ def gaussian_smooth_volume(
         return np.asarray(volume, dtype=np.float64).copy()
 
     radius = max(int(np.ceil(3.5 * sigma_voxels)), 1)
-    grid = np.arange(-radius, radius + 1, dtype=np.float64)
-    kernel = np.exp(-0.5 * (grid / sigma_voxels) ** 2)
-    kernel /= np.sum(kernel)
+    truncate_factor = float(radius) / sigma_voxels
 
     result = np.asarray(volume, dtype=np.float64).copy()
-    for axis_idx in range(result.ndim):
-        pad_width = [(0, 0)] * result.ndim
-        pad_width[axis_idx] = (radius, radius)
-        padded = np.pad(result, pad_width=pad_width, mode="edge")
-        padded_front = np.moveaxis(padded, axis_idx, 0)
-        axis_len = result.shape[axis_idx]
-        acc = np.zeros_like(padded_front[:axis_len])
-        for kernel_idx, weight in enumerate(kernel):
-            acc += float(weight) * padded_front[kernel_idx : kernel_idx + axis_len]
-        result = np.moveaxis(acc, 0, axis_idx)
+    target_axes = tuple(range(result.ndim)) if axes is None else tuple(int(ax) for ax in axes)
+    for axis_idx in target_axes:
+        # Граничное условие 'reflect' в scipy.ndimage соответствует симметричному отражению ('symmetric' в np.pad),
+        # гарантируя строгую самосопряжённость оператора фильтрации G^T = G
+        result = gaussian_filter1d(
+            result,
+            sigma=sigma_voxels,
+            axis=axis_idx,
+            mode="reflect",
+            truncate=truncate_factor,
+        )
     return result
 
 
@@ -169,6 +172,10 @@ class _RotationLookup:
     w10: NDArray[np.float64]
     w11: NDArray[np.float64]
     valid_mask: NDArray[np.bool_]
+    forward_csr: csr_matrix | None = None
+    transpose_csr: csr_matrix | None = None
+    ray_proj_csr: csr_matrix | None = None
+    ray_proj_transpose_csr: csr_matrix | None = None
 
 
 @dataclass
@@ -185,6 +192,10 @@ class _BackprojectionLookup:
     valid_mask: NDArray[np.bool_]
 
 
+_MAX_CSR_CACHE_SIZE: int = 1024
+_ROTATION_CSR_CACHE: dict[tuple[int, float], _RotationLookup] = {}
+
+
 class TomographicProjector:
     """
     Векторизованное геометрическое ядро прямого и обратного томографического
@@ -198,6 +209,11 @@ class TomographicProjector:
         Строит таблицу билинейной интерполяции для перевода из лабораторной
         системы координат `(x, y)` в систему лучей детектора под углом `angle`.
         """
+        cache_key = (int(nx), round(float(angle), 9))
+        cached = _ROTATION_CSR_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
         center = 0.5 * (nx - 1)
         coords = np.arange(nx, dtype=np.float64) - center
         grid_det, grid_ray = np.meshgrid(coords, coords, indexing="ij")
@@ -226,7 +242,7 @@ class TomographicProjector:
         w10 = delta_x * (1.0 - delta_y) * valid
         w11 = delta_x * delta_y * valid
 
-        return _RotationLookup(
+        lookup = _RotationLookup(
             x0=x0,
             x1=x1,
             y0=y0,
@@ -237,6 +253,11 @@ class TomographicProjector:
             w11=w11,
             valid_mask=valid,
         )
+        if len(_ROTATION_CSR_CACHE) >= _MAX_CSR_CACHE_SIZE:
+            oldest_key = next(iter(_ROTATION_CSR_CACHE))
+            del _ROTATION_CSR_CACHE[oldest_key]
+        _ROTATION_CSR_CACHE[cache_key] = lookup
+        return lookup
 
     @staticmethod
     def _build_inverse_rotation_lookup(nx: int, angle: float) -> _RotationLookup:
@@ -316,6 +337,91 @@ class TomographicProjector:
         return _BackprojectionLookup(u0=u0, u1=u1, w0=w0, w1=w1, valid_mask=valid)
 
     @staticmethod
+    def _ensure_rotation_csr(lookup: _RotationLookup, nx: int) -> tuple[csr_matrix, csr_matrix]:
+        """Строит и кэширует пару сопряжённых CSR-матриц билинейного поворота `(R_theta, R_theta^T)`."""
+        if lookup.forward_csr is not None and lookup.transpose_csr is not None:
+            return lookup.forward_csr, lookup.transpose_csr
+
+        num_pixels = nx * nx
+        rows_rot = np.broadcast_to(
+            np.arange(num_pixels, dtype=np.intp)[:, np.newaxis],
+            (num_pixels, 4),
+        ).ravel()
+        cols_rot = np.column_stack(
+            (
+                (lookup.x0 * nx + lookup.y0).ravel(),
+                (lookup.x0 * nx + lookup.y1).ravel(),
+                (lookup.x1 * nx + lookup.y0).ravel(),
+                (lookup.x1 * nx + lookup.y1).ravel(),
+            )
+        ).ravel()
+        vals_rot = np.column_stack(
+            (
+                lookup.w00.ravel(),
+                lookup.w01.ravel(),
+                lookup.w10.ravel(),
+                lookup.w11.ravel(),
+            )
+        ).ravel()
+
+        fwd_csr = csr_matrix((vals_rot, (rows_rot, cols_rot)), shape=(num_pixels, num_pixels))
+        tr_csr = fwd_csr.T.tocsr()
+        lookup.forward_csr = fwd_csr
+        lookup.transpose_csr = tr_csr
+        return fwd_csr, tr_csr
+
+    @staticmethod
+    def build_ray_projector_csr_pair(
+        forward_lookup: _RotationLookup,
+        nx: int,
+        ray_att_2d: NDArray[np.float64] | None = None,
+    ) -> tuple[csr_matrix, csr_matrix]:
+        """
+        Строит пару строго сопряжённых разреженных CSR-матриц `(P_theta, P_theta^T)`
+        для прямого и обратного лучевого проецирования ракурса.
+
+        Матрица `P_theta` имеет форму `(nx, nx * nx)` и объединяет билинейный поворот
+        `R_theta`, умножение на коэффициенты ослабления `ray_att_2d` и суммирование вдоль луча.
+        """
+        if (
+            ray_att_2d is None
+            and forward_lookup.ray_proj_csr is not None
+            and forward_lookup.ray_proj_transpose_csr is not None
+        ):
+            return forward_lookup.ray_proj_csr, forward_lookup.ray_proj_transpose_csr
+
+        num_pixels = nx * nx
+        det_grid = np.broadcast_to(np.arange(nx, dtype=np.intp)[:, np.newaxis], (nx, nx)).ravel()
+        rows_proj = np.broadcast_to(det_grid[:, np.newaxis], (num_pixels, 4)).ravel()
+        cols_proj = np.column_stack(
+            (
+                (forward_lookup.x0 * nx + forward_lookup.y0).ravel(),
+                (forward_lookup.x0 * nx + forward_lookup.y1).ravel(),
+                (forward_lookup.x1 * nx + forward_lookup.y0).ravel(),
+                (forward_lookup.x1 * nx + forward_lookup.y1).ravel(),
+            )
+        ).ravel()
+
+        if ray_att_2d is not None:
+            w00_att = (forward_lookup.w00 * ray_att_2d).ravel()
+            w01_att = (forward_lookup.w01 * ray_att_2d).ravel()
+            w10_att = (forward_lookup.w10 * ray_att_2d).ravel()
+            w11_att = (forward_lookup.w11 * ray_att_2d).ravel()
+        else:
+            w00_att = forward_lookup.w00.ravel()
+            w01_att = forward_lookup.w01.ravel()
+            w10_att = forward_lookup.w10.ravel()
+            w11_att = forward_lookup.w11.ravel()
+
+        vals_proj = np.column_stack((w00_att, w01_att, w10_att, w11_att)).ravel()
+        proj_csr = csr_matrix((vals_proj, (rows_proj, cols_proj)), shape=(nx, num_pixels))
+        proj_csr_transpose = proj_csr.T.tocsr()
+        if ray_att_2d is None:
+            forward_lookup.ray_proj_csr = proj_csr
+            forward_lookup.ray_proj_transpose_csr = proj_csr_transpose
+        return proj_csr, proj_csr_transpose
+
+    @staticmethod
     def _apply_rotation_lookup_3d(
         volume_3d: NDArray[np.float64],
         lookup: _RotationLookup,
@@ -324,12 +430,26 @@ class TomographicProjector:
         Применяет предвычисленную 2D таблицу билинейной интерполяции сразу ко всем
         аксиальным срезам 3D массива формы `(nx, nx, ny)`.
         """
-        return (
-            lookup.w00[:, :, np.newaxis] * volume_3d[lookup.x0, lookup.y0, :]
-            + lookup.w01[:, :, np.newaxis] * volume_3d[lookup.x0, lookup.y1, :]
-            + lookup.w10[:, :, np.newaxis] * volume_3d[lookup.x1, lookup.y0, :]
-            + lookup.w11[:, :, np.newaxis] * volume_3d[lookup.x1, lookup.y1, :]
-        )
+        nx_dim, _, ny_dim = volume_3d.shape
+        fwd_csr, _ = TomographicProjector._ensure_rotation_csr(lookup, nx_dim)
+        flat_vol = volume_3d.reshape(nx_dim * nx_dim, ny_dim)
+        return np.asarray(fwd_csr @ flat_vol, dtype=np.float64).reshape(nx_dim, nx_dim, ny_dim)
+
+    @staticmethod
+    def _apply_rotation_transpose_3d(
+        rotated_volume_3d: NDArray[np.float64],
+        lookup: _RotationLookup,
+        nx: int,
+    ) -> NDArray[np.float64]:
+        """
+        Применяет строго сопряжённый (транспонированный) оператор билинейного поворота
+        `R_theta^T` для перевода из лучевых координат детектора обратно в лабораторную
+        систему координат `(nx, nx, ny)`.
+        """
+        ny = int(rotated_volume_3d.shape[2])
+        _, tr_csr = TomographicProjector._ensure_rotation_csr(lookup, nx)
+        flat_rot = rotated_volume_3d.reshape(nx * nx, ny)
+        return np.asarray(tr_csr @ flat_rot, dtype=np.float64).reshape(nx, nx, ny)
 
     @classmethod
     def _prepare_attenuation_3d(
@@ -423,17 +543,24 @@ class TomographicProjector:
         attenuation_map: NDArray[np.float64] | None = None,
         voxel_size: float = 4.2 * mm,
         psf_fwhm: float | None = None,
+        apply_fov_mask: bool = True,
     ) -> NDArray[np.float64]:
         """
         Выполняет прямое томографическое проецирование 2D среза `(nx, nx)` или
         3D объёма `(nx, nx, ny)` на заданный набор углов с учётом ослабления
         гамма-квантов в среде `attenuation_map` и опционального размытия PSF.
 
+        Оператор прямого проецирования имеет вид:
+        `A = H_PSF * S_ray * W_att * R_theta * M_FOV`,
+        где размытие коллиматорно-детекторного отклика `H_PSF` применяется на плоскости
+        детектора после прохождения излучения через ослабляющую среду.
+
         :param volume: Входное распределение активности `(nx, nx)` или `(nx, nx, ny)`.
         :param angles: Массив углов проецирования в `hepunits`.
         :param attenuation_map: Опциональная карта линейного ослабления в `hepunits`.
         :param voxel_size: Размер вокселя в `hepunits`.
         :param psf_fwhm: Опциональная ширина гауссианы отклика коллиматора-детектора (FWHM) в `hepunits`.
+        :param apply_fov_mask: Ограничить ли входной объём вписанным кругом поля зрения (FOV).
         :return: Стек проекций формы `(views, nx)` для 2D или `(views, nx, ny)` для 3D.
         """
         vol_arr = np.asarray(volume, dtype=np.float64)
@@ -442,20 +569,17 @@ class TomographicProjector:
                 f"Ожидался 2D или 3D массив объёма, получена форма: {vol_arr.shape}"
             )
 
-        if psf_fwhm is not None and float(psf_fwhm) > 0.0:
-            vol_arr = gaussian_smooth_volume(
-                volume=vol_arr,
-                fwhm=float(psf_fwhm),
-                voxel_size=voxel_size,
-            )
-
         is_2d = vol_arr.ndim == 2
-        vol_3d = vol_arr[:, :, np.newaxis] if is_2d else vol_arr
+        vol_3d = vol_arr[:, :, np.newaxis].copy() if is_2d else vol_arr.copy()
         nx, ny_trans, ny = vol_3d.shape
         if nx != ny_trans:
             raise ValueError(
                 f"Трансаксиальные оси объёма должны быть одинаковыми (nx == ny), получено: {vol_arr.shape}"
             )
+
+        if apply_fov_mask:
+            fov_mask = create_circular_fov_mask(nx)
+            vol_3d *= fov_mask[:, :, np.newaxis]
 
         angle_seq = np.asarray(angles, dtype=np.float64).ravel()
         num_views = int(angle_seq.size)
@@ -463,13 +587,34 @@ class TomographicProjector:
         att_3d = cls._prepare_attenuation_3d(attenuation_map, nx, ny)
 
         projections = np.zeros((num_views, nx, ny), dtype=np.float64)
+        use_compact_csr = (att_3d is None or att_3d.shape[2] == 1) and ny >= 8
+        flat_vol = vol_3d.reshape(nx * nx, ny) if use_compact_csr else None
+
         for view_idx, angle in enumerate(norm_angles):
             fwd_lookup = cls._build_forward_rotation_lookup(nx, float(angle))
-            rot_vol = cls._apply_rotation_lookup_3d(vol_3d, fwd_lookup)
-            if att_3d is not None:
-                ray_att = cls.compute_ray_attenuation_factors(att_3d, fwd_lookup, voxel_size)
-                rot_vol = rot_vol * ray_att
-            projections[view_idx] = np.sum(rot_vol, axis=1)
+            if use_compact_csr and flat_vol is not None:
+                ray_att_2d = (
+                    cls.compute_ray_attenuation_factors(att_3d, fwd_lookup, voxel_size)[:, :, 0]
+                    if att_3d is not None
+                    else None
+                )
+                proj_csr, _ = cls.build_ray_projector_csr_pair(fwd_lookup, nx, ray_att_2d)
+                projections[view_idx] = np.asarray(proj_csr @ flat_vol, dtype=np.float64)
+            else:
+                rot_vol = cls._apply_rotation_lookup_3d(vol_3d, fwd_lookup)
+                if att_3d is not None:
+                    ray_att = cls.compute_ray_attenuation_factors(att_3d, fwd_lookup, voxel_size)
+                    rot_vol = rot_vol * ray_att
+                projections[view_idx] = np.sum(rot_vol, axis=1)
+
+        if psf_fwhm is not None and float(psf_fwhm) > 0.0:
+            smooth_axes = (1,) if is_2d else (1, 2)
+            projections = gaussian_smooth_volume(
+                volume=projections,
+                fwhm=float(psf_fwhm),
+                voxel_size=voxel_size,
+                axes=smooth_axes,
+            )
 
         return projections[:, :, 0] if is_2d else projections
 
@@ -484,9 +629,14 @@ class TomographicProjector:
         psf_fwhm: float | None = None,
     ) -> NDArray[np.float64]:
         """
-        Выполняет обратное томографическое проецирование стека проекций
+        Выполняет строго сопряжённое обратное томографическое проецирование стека проекций
         `(views, nx)` или `(views, nx, ny)` в лабораторную систему координат
         `(nx, nx)` или `(nx, nx, ny)` с опциональным учётом весов затухания и PSF.
+
+        Оператор обратного проецирования является точным эрмитово-сопряжённым оператором
+        к `forward_project`:
+        `A^T = M_FOV * R_theta^T * W_att * S_ray^T * H_PSF^T`,
+        удовлетворяющим тождеству `<A x, y> == <x, A^T y>`.
 
         :param projections: Входной стек проекций `(views, nx)` или `(views, nx, ny)`.
         :param angles: Углы поворота детектора в `hepunits`.
@@ -503,38 +653,41 @@ class TomographicProjector:
             )
 
         is_2d = proj_arr.ndim == 2
-        proj_3d = proj_arr[:, :, np.newaxis] if is_2d else proj_arr
+        proj_3d = proj_arr[:, :, np.newaxis].copy() if is_2d else proj_arr.copy()
         num_views, nx, ny = proj_3d.shape
         norm_angles = normalize_projection_angles(angles, num_views)
         att_3d = cls._prepare_attenuation_3d(attenuation_map, nx, ny)
 
-        volume_3d = np.zeros((nx, nx, ny), dtype=np.float64)
-        for view_idx, angle in enumerate(norm_angles):
-            bp_lookup = cls._build_backprojection_1d_lookup(nx, float(angle))
-            proj_view = proj_3d[view_idx]
-            # 1D линейная интерполяция вдоль координаты детектора
-            backproj_view = (
-                bp_lookup.w0[:, :, np.newaxis] * proj_view[bp_lookup.u0, :]
-                + bp_lookup.w1[:, :, np.newaxis] * proj_view[bp_lookup.u1, :]
-            )
-            if att_3d is not None:
-                fwd_lookup = cls._build_forward_rotation_lookup(nx, float(angle))
-                inv_lookup = cls._build_inverse_rotation_lookup(nx, float(angle))
-                voxel_att = cls.compute_voxel_attenuation_weights_for_angle(
-                    attenuation_3d=att_3d,
-                    forward_lookup=fwd_lookup,
-                    inverse_lookup=inv_lookup,
-                    voxel_size=voxel_size,
-                )
-                backproj_view = backproj_view * voxel_att
-            volume_3d += backproj_view
-
         if psf_fwhm is not None and float(psf_fwhm) > 0.0:
-            volume_3d = gaussian_smooth_volume(
-                volume=volume_3d,
+            smooth_axes = (1,) if is_2d else (1, 2)
+            proj_3d = gaussian_smooth_volume(
+                volume=proj_3d,
                 fwhm=float(psf_fwhm),
                 voxel_size=voxel_size,
+                axes=smooth_axes,
             )
+
+        if att_3d is None or att_3d.shape[2] == 1:
+            flat_volume = np.zeros((nx * nx, ny), dtype=np.float64)
+            for view_idx, angle in enumerate(norm_angles):
+                fwd_lookup = cls._build_forward_rotation_lookup(nx, float(angle))
+                ray_att_2d = (
+                    cls.compute_ray_attenuation_factors(att_3d, fwd_lookup, voxel_size)[:, :, 0]
+                    if att_3d is not None
+                    else None
+                )
+                _, proj_csr_transpose = cls.build_ray_projector_csr_pair(fwd_lookup, nx, ray_att_2d)
+                flat_volume += np.asarray(proj_csr_transpose @ proj_3d[view_idx], dtype=np.float64)
+            volume_3d = flat_volume.reshape(nx, nx, ny)
+        else:
+            volume_3d = np.zeros((nx, nx, ny), dtype=np.float64)
+            for view_idx, angle in enumerate(norm_angles):
+                fwd_lookup = cls._build_forward_rotation_lookup(nx, float(angle))
+                proj_view = proj_3d[view_idx]
+                rot_backproj = np.broadcast_to(proj_view[:, np.newaxis, :], (nx, nx, ny))
+                ray_att = cls.compute_ray_attenuation_factors(att_3d, fwd_lookup, voxel_size)
+                rot_backproj = rot_backproj * ray_att
+                volume_3d += cls._apply_rotation_transpose_3d(rot_backproj, fwd_lookup, nx)
 
         if apply_fov_mask:
             fov_mask = create_circular_fov_mask(nx)

@@ -21,6 +21,7 @@ from typing import Any
 import numpy as np
 from hepunits import mm
 from numpy.typing import NDArray
+from scipy.sparse import csr_matrix
 
 from nmspect.reconstruction.attenuation import (
     create_uniform_attenuation_map,
@@ -28,7 +29,6 @@ from nmspect.reconstruction.attenuation import (
 )
 from nmspect.reconstruction.projector import (
     TomographicProjector,
-    _BackprojectionLookup,
     _RotationLookup,
     create_circular_fov_mask,
     gaussian_smooth_volume,
@@ -201,7 +201,8 @@ class OSEMReconstructor:
     ) -> NDArray[np.float64]:
         """
         Вычисляет градиент априорного потенциала гиббсовской регуляризации
-        (квадратичной или Total Variation) для схемы One-Step-Late (OSL).
+        (квадратичной или Total Variation) для схемы One-Step-Late (OSL)
+        с однородными граничными условиями Неймана (нулевой поток на границе).
         """
         if self.prior_type == "none" or self.prior_beta <= 0.0:
             return np.zeros_like(estimate_3d)
@@ -211,15 +212,23 @@ class OSEMReconstructor:
         tv_eps = max(self.regularization_epsilon, 1e-6)
 
         for axis_idx in active_axes:
-            shifted_plus = np.roll(estimate_3d, shift=-1, axis=axis_idx)
-            shifted_minus = np.roll(estimate_3d, shift=1, axis=axis_idx)
-            diff_plus = estimate_3d - shifted_plus
-            diff_minus = estimate_3d - shifted_minus
+            if estimate_3d.shape[axis_idx] <= 1:
+                continue
+            slice_left = tuple(
+                slice(0, -1) if idx == axis_idx else slice(None)
+                for idx in range(estimate_3d.ndim)
+            )
+            slice_right = tuple(
+                slice(1, None) if idx == axis_idx else slice(None)
+                for idx in range(estimate_3d.ndim)
+            )
+            interior_diff = estimate_3d[slice_left] - estimate_3d[slice_right]
             if self.prior_type == "quadratic":
-                grad += diff_plus + diff_minus
-            elif self.prior_type == "tv":
-                grad += diff_plus / np.sqrt(diff_plus * diff_plus + tv_eps)
-                grad += diff_minus / np.sqrt(diff_minus * diff_minus + tv_eps)
+                flux = interior_diff
+            else:
+                flux = interior_diff / np.sqrt(interior_diff * interior_diff + tv_eps)
+            grad[slice_left] += flux
+            grad[slice_right] -= flux
         return grad
 
     def _resolve_attenuation_map(
@@ -276,202 +285,15 @@ class OSEMReconstructor:
         :param initial_estimate: Опциональное начальное приближение объёма.
         :return: Объект `ReconstructionResult`.
         """
-        proj_arr = np.asarray(projections, dtype=np.float64)
-        if proj_arr.ndim not in (2, 3):
-            raise ValueError(
-                f"Ожидался 2D или 3D массив проекций, получена форма: {proj_arr.shape}"
-            )
-
-        is_2d = proj_arr.ndim == 2
-        proj_3d = np.clip(proj_arr[:, :, np.newaxis] if is_2d else proj_arr, 0.0, None)
-        num_views, nx, ny = proj_3d.shape
-
-        active_voxel_size = float(voxel_size) if voxel_size is not None else self.voxel_size
-        norm_angles = normalize_projection_angles(angles, num_views)
-
-        resolved_att = self._resolve_attenuation_map(
-            projections=proj_arr,
-            angles=norm_angles,
-            override_attenuation_map=attenuation_map,
-            active_voxel_size=active_voxel_size,
+        results = self.reconstruct_iterations(
+            projections=projections,
+            angles=angles,
+            attenuation_map=attenuation_map,
+            voxel_size=voxel_size,
+            initial_estimate=initial_estimate,
+            iterations_to_save=(self.num_iterations,),
         )
-        att_3d = TomographicProjector._prepare_attenuation_3d(resolved_att, nx, ny)
-
-        fov_mask = (
-            create_circular_fov_mask(nx) if self.apply_fov_mask else np.ones((nx, nx), dtype=bool)
-        )
-        fov_mask_3d = fov_mask[:, :, np.newaxis]
-
-        # Предвычисление таблиц интерполяции и весов ослабления для всех ракурсов
-        forward_lookups: list[_RotationLookup] = []
-        bp_lookups: list[_BackprojectionLookup] = []
-        ray_att_list: list[NDArray[np.float64] | None] = []
-        voxel_att_list: list[NDArray[np.float64] | None] = []
-
-        for view_idx in range(num_views):
-            angle_val = float(norm_angles[view_idx])
-            fwd_lkp = TomographicProjector._build_forward_rotation_lookup(nx, angle_val)
-            bp_lkp = TomographicProjector._build_backprojection_1d_lookup(nx, angle_val)
-            forward_lookups.append(fwd_lkp)
-            bp_lookups.append(bp_lkp)
-
-            if att_3d is not None:
-                inv_lkp = TomographicProjector._build_inverse_rotation_lookup(nx, angle_val)
-                ray_att = TomographicProjector.compute_ray_attenuation_factors(
-                    attenuation_3d=att_3d,
-                    forward_lookup=fwd_lkp,
-                    voxel_size=active_voxel_size,
-                )
-                vox_att = TomographicProjector._apply_rotation_lookup_3d(ray_att, inv_lkp)
-                vox_att = np.clip(vox_att, 0.0, 1.0)
-                ray_att_list.append(ray_att)
-                voxel_att_list.append(vox_att)
-            else:
-                ray_att_list.append(None)
-                voxel_att_list.append(None)
-
-        subsets = self.build_ordered_subsets(num_views)
-
-        # Предвычисление карт чувствительности для каждого подмножества
-        sensitivity_maps: list[NDArray[np.float64]] = []
-        total_sensitivity = np.zeros((nx, nx, ny), dtype=np.float64)
-        for subset in subsets:
-            sub_sens = np.zeros((nx, nx, ny), dtype=np.float64)
-            for view_idx in subset:
-                bp_lkp = bp_lookups[int(view_idx)]
-                unit_bp = (bp_lkp.w0 + bp_lkp.w1)[:, :, np.newaxis]
-                vox_att_item = voxel_att_list[int(view_idx)]
-                if vox_att_item is not None:
-                    unit_bp = unit_bp * vox_att_item
-                sub_sens += unit_bp
-            sub_sens *= fov_mask_3d
-            sensitivity_maps.append(sub_sens)
-            total_sensitivity += sub_sens
-
-        # Начальное приближение: однородное положительное распределение внутри FOV,
-        # масштабированное по среднему числу отсчётов на проекцию
-        expected_shape = (nx, nx) if is_2d else (nx, nx, ny)
-        if initial_estimate is not None:
-            est_arr = np.asarray(initial_estimate, dtype=np.float64)
-            if est_arr.shape != expected_shape:
-                raise ValueError(
-                    f"Неверная форма начального приближения initial_estimate {est_arr.shape}, "
-                    f"ожидалось {expected_shape}."
-                )
-            estimate = (
-                est_arr[:, :, np.newaxis] if est_arr.ndim == 2 else est_arr.copy()
-            ) * fov_mask_3d
-            estimate = np.clip(estimate, self.regularization_epsilon, None) * fov_mask_3d
-        else:
-            active_voxels_per_slice = max(float(np.sum(fov_mask)), 1.0)
-            mean_counts_per_view = np.mean(np.sum(proj_3d, axis=1), axis=0)
-            init_slice_vals = np.maximum(mean_counts_per_view / active_voxels_per_slice, 1e-4)
-            estimate = np.broadcast_to(
-                init_slice_vals[np.newaxis, np.newaxis, :], (nx, nx, ny)
-            ).copy()
-            estimate *= fov_mask_3d
-
-        eps = self.regularization_epsilon
-        out_sens = total_sensitivity[:, :, 0] if is_2d else total_sensitivity
-        method_label = "MLEM" if len(subsets) == 1 else "OSEM"
-        active_psf_fwhm: float | None = (
-            self.psf_fwhm if (self.psf_fwhm is not None and self.psf_fwhm > 0.0) else None
-        )
-
-        # Основной итерационный цикл OSEM / MLEM
-        for _ in range(self.num_iterations):
-            for sub_idx, subset in enumerate(subsets):
-                sub_sens = sensitivity_maps[sub_idx]
-                backprojected_ratio = np.zeros((nx, nx, ny), dtype=np.float64)
-
-                source_est = (
-                    gaussian_smooth_volume(
-                        volume=estimate[:, :, 0] if is_2d else estimate,
-                        fwhm=active_psf_fwhm,
-                        voxel_size=active_voxel_size,
-                    )
-                    if active_psf_fwhm is not None
-                    else estimate
-                )
-                if active_psf_fwhm is not None and is_2d:
-                    source_est = source_est[:, :, np.newaxis]
-
-                for view_idx in subset:
-                    v_idx = int(view_idx)
-                    fwd_lkp = forward_lookups[v_idx]
-                    bp_lkp = bp_lookups[v_idx]
-
-                    # 1. Прямое проецирование текущей оценки с учётом затухания
-                    rot_est = TomographicProjector._apply_rotation_lookup_3d(source_est, fwd_lkp)
-                    ray_att_item = ray_att_list[v_idx]
-                    if ray_att_item is not None:
-                        rot_est = rot_est * ray_att_item
-                    expected_proj = np.sum(rot_est, axis=1)
-
-                    # 2. Отношение измеренной проекции к ожидаемой P / (H * f + eps)
-                    measured_proj = proj_3d[v_idx]
-                    ratio = np.where(
-                        expected_proj > eps,
-                        measured_proj / (expected_proj + eps),
-                        0.0,
-                    )
-
-                    # 3. Обратное проецирование отношения с весом затухания H^T * ratio
-                    bp_view = (
-                        bp_lkp.w0[:, :, np.newaxis] * ratio[bp_lkp.u0, :]
-                        + bp_lkp.w1[:, :, np.newaxis] * ratio[bp_lkp.u1, :]
-                    )
-                    vox_att_view = voxel_att_list[v_idx]
-                    if vox_att_view is not None:
-                        bp_view = bp_view * vox_att_view
-                    backprojected_ratio += bp_view
-
-                if active_psf_fwhm is not None:
-                    smoothed_bp = gaussian_smooth_volume(
-                        volume=backprojected_ratio[:, :, 0] if is_2d else backprojected_ratio,
-                        fwhm=active_psf_fwhm,
-                        voxel_size=active_voxel_size,
-                    )
-                    backprojected_ratio = (
-                        smoothed_bp[:, :, np.newaxis] if is_2d else smoothed_bp
-                    )
-
-                # 4. Мультипликативное обновление оценки в области положительной чувствительности
-                eff_denom = sub_sens
-                if self.prior_type != "none" and self.prior_beta > 0.0:
-                    prior_grad = self._compute_prior_gradient_3d(estimate)
-                    eff_denom = np.maximum(sub_sens + self.prior_beta * prior_grad, eps)
-                valid_sens = sub_sens > eps
-                update_factor = np.where(
-                    valid_sens, backprojected_ratio / np.maximum(eff_denom, eps), 0.0
-                )
-                estimate = np.asarray(
-                    np.where(valid_sens, estimate * update_factor, 0.0) * fov_mask_3d,
-                    dtype=np.float64,
-                )
-
-        if self.post_smoothing_fwhm is not None and self.post_smoothing_fwhm > 0.0:
-            estimate = gaussian_smooth_volume(
-                volume=estimate,
-                fwhm=self.post_smoothing_fwhm,
-                voxel_size=active_voxel_size,
-            )
-            estimate *= fov_mask_3d
-
-        out_vol = estimate[:, :, 0] if is_2d else estimate
-
-        return ReconstructionResult(
-            volume=out_vol,
-            voxel_size=active_voxel_size,
-            method=method_label,
-            attenuation_corrected=resolved_att is not None,
-            correction_map=out_sens,
-            metadata={
-                "num_iterations": self.num_iterations,
-                "num_subsets": len(subsets),
-                "post_smoothing_fwhm": self.post_smoothing_fwhm,
-            },
-        )
+        return results[self.num_iterations]
 
     def reconstruct_iterations(
         self,
@@ -506,7 +328,12 @@ class OSEMReconstructor:
             if iterations_to_save is not None
             else list(range(1, self.num_iterations + 1))
         )
-        max_iter = max(target_iters) if target_iters else self.num_iterations
+        if not target_iters:
+            raise ValueError(
+                "Список сохраняемых итераций iterations_to_save должен содержать "
+                "хотя бы один положительный номер итерации >= 1."
+            )
+        max_iter = max(target_iters)
         target_set = set(target_iters)
 
         is_2d = proj_arr.ndim == 2
@@ -529,48 +356,75 @@ class OSEMReconstructor:
         )
         fov_mask_3d = fov_mask[:, :, np.newaxis]
 
+        use_compact_csr = att_3d is None or att_3d.shape[2] == 1
         forward_lookups: list[_RotationLookup] = []
-        bp_lookups: list[_BackprojectionLookup] = []
         ray_att_list: list[NDArray[np.float64] | None] = []
-        voxel_att_list: list[NDArray[np.float64] | None] = []
+        proj_csr_list: list[csr_matrix] = []
+        proj_csr_transpose_list: list[csr_matrix] = []
 
         for view_idx in range(num_views):
             angle_val = float(norm_angles[view_idx])
             fwd_lkp = TomographicProjector._build_forward_rotation_lookup(nx, angle_val)
-            bp_lkp = TomographicProjector._build_backprojection_1d_lookup(nx, angle_val)
             forward_lookups.append(fwd_lkp)
-            bp_lookups.append(bp_lkp)
 
             if att_3d is not None:
-                inv_lkp = TomographicProjector._build_inverse_rotation_lookup(nx, angle_val)
                 ray_att = TomographicProjector.compute_ray_attenuation_factors(
                     attenuation_3d=att_3d,
                     forward_lookup=fwd_lkp,
                     voxel_size=active_voxel_size,
                 )
-                vox_att = TomographicProjector._apply_rotation_lookup_3d(ray_att, inv_lkp)
-                vox_att = np.clip(vox_att, 0.0, 1.0)
                 ray_att_list.append(ray_att)
-                voxel_att_list.append(vox_att)
             else:
+                ray_att = None
                 ray_att_list.append(None)
-                voxel_att_list.append(None)
+
+            if use_compact_csr:
+                ray_att_2d = ray_att[:, :, 0] if ray_att is not None else None
+                proj_csr, proj_csr_tr = TomographicProjector.build_ray_projector_csr_pair(
+                    fwd_lkp, nx, ray_att_2d
+                )
+                proj_csr_list.append(proj_csr)
+                proj_csr_transpose_list.append(proj_csr_tr)
+            else:
+                TomographicProjector._ensure_rotation_csr(fwd_lkp, nx)
 
         subsets = self.build_ordered_subsets(num_views)
         sensitivity_maps: list[NDArray[np.float64]] = []
         total_sensitivity = np.zeros((nx, nx, ny), dtype=np.float64)
-        for subset in subsets:
-            sub_sens = np.zeros((nx, nx, ny), dtype=np.float64)
-            for view_idx in subset:
-                bp_lkp = bp_lookups[int(view_idx)]
-                unit_bp = (bp_lkp.w0 + bp_lkp.w1)[:, :, np.newaxis]
-                vox_att_item = voxel_att_list[int(view_idx)]
-                if vox_att_item is not None:
-                    unit_bp = unit_bp * vox_att_item
-                sub_sens += unit_bp
-            sub_sens *= fov_mask_3d
-            sensitivity_maps.append(sub_sens)
-            total_sensitivity += sub_sens
+
+        if use_compact_csr:
+            ones_det_col = np.ones((nx, 1), dtype=np.float64)
+            for subset in subsets:
+                sub_sens_2d = np.zeros((nx * nx, 1), dtype=np.float64)
+                for view_idx in subset:
+                    v_idx = int(view_idx)
+                    sub_sens_2d += np.asarray(
+                        proj_csr_transpose_list[v_idx] @ ones_det_col, dtype=np.float64
+                    )
+                sub_sens = (
+                    np.broadcast_to(sub_sens_2d.reshape(nx, nx, 1), (nx, nx, ny)) * fov_mask_3d
+                )
+                sensitivity_maps.append(sub_sens)
+                total_sensitivity += sub_sens
+        else:
+            ones_ray_3d = np.ones((nx, nx, ny), dtype=np.float64)
+            for subset in subsets:
+                sub_sens = np.zeros((nx, nx, ny), dtype=np.float64)
+                for view_idx in subset:
+                    v_idx = int(view_idx)
+                    fwd_lkp = forward_lookups[v_idx]
+                    ray_att_item = ray_att_list[v_idx]
+                    unit_ray = (
+                        np.broadcast_to(ray_att_item, (nx, nx, ny))
+                        if ray_att_item is not None
+                        else ones_ray_3d
+                    )
+                    sub_sens += TomographicProjector._apply_rotation_transpose_3d(
+                        unit_ray, fwd_lkp, nx
+                    )
+                sub_sens *= fov_mask_3d
+                sensitivity_maps.append(sub_sens)
+                total_sensitivity += sub_sens
 
         expected_shape = (nx, nx) if is_2d else (nx, nx, ny)
         if initial_estimate is not None:
@@ -600,65 +454,97 @@ class OSEMReconstructor:
         active_psf_fwhm: float | None = (
             self.psf_fwhm if (self.psf_fwhm is not None and self.psf_fwhm > 0.0) else None
         )
+        proj_smooth_axes = (0,) if is_2d else (0, 1)
 
         for iter_idx in range(1, max_iter + 1):
             for sub_idx, subset in enumerate(subsets):
                 sub_sens = sensitivity_maps[sub_idx]
-                backprojected_ratio = np.zeros((nx, nx, ny), dtype=np.float64)
 
-                source_est = (
-                    gaussian_smooth_volume(
-                        volume=estimate[:, :, 0] if is_2d else estimate,
-                        fwhm=active_psf_fwhm,
-                        voxel_size=active_voxel_size,
-                    )
-                    if active_psf_fwhm is not None
-                    else estimate
-                )
-                if active_psf_fwhm is not None and is_2d:
-                    source_est = source_est[:, :, np.newaxis]
+                if use_compact_csr:
+                    flat_estimate = estimate.reshape(nx * nx, ny)
+                    flat_bp_ratio = np.zeros((nx * nx, ny), dtype=np.float64)
 
-                for view_idx in subset:
-                    v_idx = int(view_idx)
-                    fwd_lkp = forward_lookups[v_idx]
-                    bp_lkp = bp_lookups[v_idx]
+                    for view_idx in subset:
+                        v_idx = int(view_idx)
+                        expected_proj = np.asarray(
+                            proj_csr_list[v_idx] @ flat_estimate, dtype=np.float64
+                        )
+                        if active_psf_fwhm is not None:
+                            expected_proj = gaussian_smooth_volume(
+                                volume=expected_proj,
+                                fwhm=active_psf_fwhm,
+                                voxel_size=active_voxel_size,
+                                axes=proj_smooth_axes,
+                            )
 
-                    rot_est = TomographicProjector._apply_rotation_lookup_3d(source_est, fwd_lkp)
-                    ray_att_item = ray_att_list[v_idx]
-                    if ray_att_item is not None:
-                        rot_est = rot_est * ray_att_item
-                    expected_proj = np.sum(rot_est, axis=1)
+                        measured_proj = proj_3d[v_idx]
+                        ratio = np.where(
+                            expected_proj > eps,
+                            measured_proj / (expected_proj + eps),
+                            0.0,
+                        )
 
-                    measured_proj = proj_3d[v_idx]
-                    ratio = np.where(
-                        expected_proj > eps,
-                        measured_proj / (expected_proj + eps),
-                        0.0,
-                    )
+                        if active_psf_fwhm is not None:
+                            ratio = gaussian_smooth_volume(
+                                volume=ratio,
+                                fwhm=active_psf_fwhm,
+                                voxel_size=active_voxel_size,
+                                axes=proj_smooth_axes,
+                            )
+                        flat_bp_ratio += np.asarray(
+                            proj_csr_transpose_list[v_idx] @ ratio, dtype=np.float64
+                        )
 
-                    bp_view = (
-                        bp_lkp.w0[:, :, np.newaxis] * ratio[bp_lkp.u0, :]
-                        + bp_lkp.w1[:, :, np.newaxis] * ratio[bp_lkp.u1, :]
-                    )
-                    vox_att_view = voxel_att_list[v_idx]
-                    if vox_att_view is not None:
-                        bp_view = bp_view * vox_att_view
-                    backprojected_ratio += bp_view
+                    backprojected_ratio = flat_bp_ratio.reshape(nx, nx, ny)
+                else:
+                    backprojected_ratio = np.zeros((nx, nx, ny), dtype=np.float64)
+                    for view_idx in subset:
+                        v_idx = int(view_idx)
+                        fwd_lkp = forward_lookups[v_idx]
+                        ray_att_item = ray_att_list[v_idx]
 
-                if active_psf_fwhm is not None:
-                    smoothed_bp = gaussian_smooth_volume(
-                        volume=backprojected_ratio[:, :, 0] if is_2d else backprojected_ratio,
-                        fwhm=active_psf_fwhm,
-                        voxel_size=active_voxel_size,
-                    )
-                    backprojected_ratio = (
-                        smoothed_bp[:, :, np.newaxis] if is_2d else smoothed_bp
-                    )
+                        rot_est = TomographicProjector._apply_rotation_lookup_3d(estimate, fwd_lkp)
+                        if ray_att_item is not None:
+                            rot_est = rot_est * ray_att_item
+                        expected_proj = np.sum(rot_est, axis=1)
+                        if active_psf_fwhm is not None:
+                            expected_proj = gaussian_smooth_volume(
+                                volume=expected_proj,
+                                fwhm=active_psf_fwhm,
+                                voxel_size=active_voxel_size,
+                                axes=proj_smooth_axes,
+                            )
+
+                        measured_proj = proj_3d[v_idx]
+                        ratio = np.where(
+                            expected_proj > eps,
+                            measured_proj / (expected_proj + eps),
+                            0.0,
+                        )
+
+                        if active_psf_fwhm is not None:
+                            ratio = gaussian_smooth_volume(
+                                volume=ratio,
+                                fwhm=active_psf_fwhm,
+                                voxel_size=active_voxel_size,
+                                axes=proj_smooth_axes,
+                            )
+                        rot_ratio = np.broadcast_to(ratio[:, np.newaxis, :], (nx, nx, ny))
+                        if ray_att_item is not None:
+                            rot_ratio = rot_ratio * ray_att_item
+                        backprojected_ratio += TomographicProjector._apply_rotation_transpose_3d(
+                            rot_ratio, fwd_lkp, nx
+                        )
 
                 eff_denom = sub_sens
                 if self.prior_type != "none" and self.prior_beta > 0.0:
+                    subset_weight = float(len(subset)) / float(num_views)
                     prior_grad = self._compute_prior_gradient_3d(estimate)
-                    eff_denom = np.maximum(sub_sens + self.prior_beta * prior_grad, eps)
+                    min_safe_denom = np.maximum(0.1 * sub_sens, eps)
+                    eff_denom = np.maximum(
+                        sub_sens + (self.prior_beta * subset_weight) * prior_grad,
+                        min_safe_denom,
+                    )
                 valid_sens = sub_sens > eps
                 update_factor = np.where(
                     valid_sens, backprojected_ratio / np.maximum(eff_denom, eps), 0.0

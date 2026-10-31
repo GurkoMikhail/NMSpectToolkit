@@ -187,8 +187,11 @@ class VtkParaviewExporter:
             )
         )
         radius_val = float(orbit_radius / mm)
+        crystal_thick = det_dims[2]
         collimator_thick = 35.0
         casing_thick = 60.0
+        collimator_center_y = radius_val - 0.5 * crystal_thick - 0.5 * collimator_thick
+        casing_center_y = radius_val + 0.5 * crystal_thick + 0.5 * casing_thick
 
         block_entries: list[tuple[str, str]] = []
 
@@ -204,7 +207,7 @@ class VtkParaviewExporter:
         collimator_1_vti = blocks_dir / "Collimator_1.vti"
         self._write_structural_box_vti(
             file_path=collimator_1_vti,
-            center=(0.0, -(radius_val - 0.5 * collimator_thick), 0.0),
+            center=(0.0, collimator_center_y, 0.0),
             lengths=(det_dims[0], collimator_thick, det_dims[1]),
         )
         block_entries.append(("Collimator_1", f"{blocks_dir.name}/{collimator_1_vti.name}"))
@@ -212,7 +215,7 @@ class VtkParaviewExporter:
         collimator_2_vti = blocks_dir / "Collimator_2.vti"
         self._write_structural_box_vti(
             file_path=collimator_2_vti,
-            center=(0.0, radius_val - 0.5 * collimator_thick, 0.0),
+            center=(0.0, -collimator_center_y, 0.0),
             lengths=(det_dims[0], collimator_thick, det_dims[1]),
         )
         block_entries.append(("Collimator_2", f"{blocks_dir.name}/{collimator_2_vti.name}"))
@@ -220,7 +223,7 @@ class VtkParaviewExporter:
         casing_1_vti = blocks_dir / "Casing_1.vti"
         self._write_structural_box_vti(
             file_path=casing_1_vti,
-            center=(0.0, -(radius_val + det_dims[2] + 0.5 * casing_thick), 0.0),
+            center=(0.0, casing_center_y, 0.0),
             lengths=(det_dims[0] + 20.0, casing_thick, det_dims[1] + 20.0),
         )
         block_entries.append(("Casing_1", f"{blocks_dir.name}/{casing_1_vti.name}"))
@@ -228,19 +231,19 @@ class VtkParaviewExporter:
         casing_2_vti = blocks_dir / "Casing_2.vti"
         self._write_structural_box_vti(
             file_path=casing_2_vti,
-            center=(0.0, radius_val + det_dims[2] + 0.5 * casing_thick, 0.0),
+            center=(0.0, -casing_center_y, 0.0),
             lengths=(det_dims[0] + 20.0, casing_thick, det_dims[1] + 20.0),
         )
         block_entries.append(("Casing_2", f"{blocks_dir.name}/{casing_2_vti.name}"))
 
-        # 2. Текстурированные проекции на кристаллах детекторов 1 и 2
+        # 2. Текстурированные проекции на кристаллах детекторов 1 (+Y при 0°) и 2 (-Y при 180°)
         det1_proj_vti = blocks_dir / "Detector_1_Projection.vti"
         self._write_projection_plane_vti(
             file_path=det1_proj_vti,
             projection_2d=proj_arr[0],
             pixel_size=pixel_size,
-            center_y=-orbit_radius,
-            thickness_y=det_dims[2] * mm,
+            center_y=orbit_radius,
+            thickness_y=crystal_thick * mm,
             window_config=window_config,
         )
         block_entries.append(("Detector_1_Projection", f"{blocks_dir.name}/{det1_proj_vti.name}"))
@@ -259,10 +262,10 @@ class VtkParaviewExporter:
         det2_proj_vti = blocks_dir / "Detector_2_Projection.vti"
         self._write_projection_plane_vti(
             file_path=det2_proj_vti,
-            projection_2d=proj_arr[second_view_idx],
+            projection_2d=proj_arr[second_view_idx][::-1, :],
             pixel_size=pixel_size,
-            center_y=orbit_radius,
-            thickness_y=det_dims[2] * mm,
+            center_y=-orbit_radius,
+            thickness_y=crystal_thick * mm,
             window_config=window_config,
         )
         block_entries.append(("Detector_2_Projection", f"{blocks_dir.name}/{det2_proj_vti.name}"))

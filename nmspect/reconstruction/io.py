@@ -170,8 +170,15 @@ def load_projections_from_dicom(
         elif "StartAngle" in rot_item and "AngularStep" in rot_item:
             start_val = float(rot_item["StartAngle"].value) * deg
             step_val = float(rot_item["AngularStep"].value) * deg
-            raw_angles = (
-                start_val + np.arange(projections.shape[0], dtype=np.float64) * step_val
+            rot_dir = (
+                str(rot_item["RotationDirection"].value).strip().upper()
+                if "RotationDirection" in rot_item
+                else "CCW"
+            )
+            dir_sign = -1.0 if rot_dir == "CW" else 1.0
+            raw_angles = np.mod(
+                start_val + dir_sign * np.arange(projections.shape[0], dtype=np.float64) * step_val,
+                360.0 * deg,
             )
 
     norm_angles = normalize_projection_angles(raw_angles, int(projections.shape[0]))

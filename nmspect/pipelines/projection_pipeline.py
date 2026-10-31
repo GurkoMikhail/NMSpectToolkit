@@ -18,7 +18,6 @@ from nmspect.exporters.nexus import NeXusExporter
 from nmspect.exporters.vtk_paraview import VtkParaviewExporter
 from nmspect.io.hdf5_reader import (
     SimulationDataExtractor,
-    clear_hdf5_status_flags_if_needed,
     parse_gantry_angle_from_filename,
 )
 from nmspect.io.legacy_formats import (
@@ -29,7 +28,6 @@ from nmspect.io.legacy_formats import (
 from nmspect.spectrometry.analyzer import SpectrumProcessor
 from nmspect.spectrometry.models import EnergyWindowConfig, SpectrumResult
 from nmspect.spectrometry.presets import (
-    TB161_PEAK_75,
     TC99M_PEAK_140,
     get_energy_window_preset,
     list_available_presets,
@@ -46,8 +44,9 @@ DEFAULT_STUDY_PREFIXES: dict[str, str] = {
     "99mTc": "tc99m_nema_120views",
 }
 
+# Паспортное энергетическое разрешение сцинтиллятора NaI(Tl) (9.5%) калибруется на линии 99mTc (140.5 кэВ)
 DEFAULT_REFERENCE_ENERGIES: dict[str, float] = {
-    "161Tb": TB161_PEAK_75,
+    "161Tb": TC99M_PEAK_140,
     "99mTc": TC99M_PEAK_140,
 }
 
@@ -192,7 +191,6 @@ def collect_projection_data(
     simulation_metadata: dict[str, Any] = {}
 
     for hdf_path in hdf_files:
-        clear_hdf5_status_flags_if_needed(hdf_path)
         extractor = SimulationDataExtractor(hdf_path)
 
         if not simulation_metadata:
@@ -424,7 +422,7 @@ def run_isotope_nema_pipeline(
         spectrum_result = spectrum_processor.analyze(
             energies=dataset.all_energies,
             scatter_orders=dataset.all_scatter_orders,
-            window_config=primary_window,
+            window_config=windows,
         )
 
         study_name = f"{prefix}_{preset_key}"

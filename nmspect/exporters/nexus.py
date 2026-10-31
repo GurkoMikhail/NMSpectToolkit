@@ -215,8 +215,8 @@ class NeXusExporter:
 
             num_x, num_y = proj_arr.shape[1], proj_arr.shape[2]
             step_val = float(pixel_size / mm)
-            coords_x = (np.arange(num_x, dtype=np.float32) - 0.5 * float(num_x)) * step_val
-            coords_y = (np.arange(num_y, dtype=np.float32) - 0.5 * float(num_y)) * step_val
+            coords_x = (np.arange(num_x, dtype=np.float32) - 0.5 * float(num_x - 1)) * step_val
+            coords_y = (np.arange(num_y, dtype=np.float32) - 0.5 * float(num_y - 1)) * step_val
 
             ds_coord_x = data_grp.create_dataset("x", data=coords_x)
             ds_coord_x.attrs["units"] = "mm"

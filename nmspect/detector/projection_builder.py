@@ -10,6 +10,62 @@ from numpy.typing import NDArray
 from nmspect.spectrometry.models import EnergyWindowConfig
 
 
+def _accumulate_window_projection(
+    energies_arr: NDArray[np.float64],
+    x_arr: NDArray[np.float64],
+    y_arr: NDArray[np.float64],
+    edges_x: NDArray[np.float64],
+    edges_y: NDArray[np.float64],
+    window_config: EnergyWindowConfig,
+    clip_negative: bool,
+) -> NDArray[np.float64]:
+    """Внутренняя функция построения 2D-проекции по предвычисленным сеткам бинов `edges_x`, `edges_y`."""
+    num_bins_x = edges_x.size - 1
+    num_bins_y = edges_y.size - 1
+    projection = np.zeros((num_bins_x, num_bins_y), dtype=np.float64)
+    if energies_arr.size == 0:
+        return projection
+
+    main_weight = (
+        float(window_config.scatter_weight)
+        if window_config.is_scatter_window and window_config.scatter_weight != 0.0
+        else 1.0
+    )
+    main_mask = (energies_arr >= window_config.lower_bound) & (energies_arr <= window_config.upper_bound)
+    if np.any(main_mask):
+        main_hist, _, _ = np.histogram2d(
+            x_arr[main_mask],
+            y_arr[main_mask],
+            bins=(edges_x, edges_y),
+        )
+        projection += main_weight * main_hist
+
+    for assoc_win in window_config.associated_windows:
+        low_cond = (
+            energies_arr > assoc_win.lower_bound
+            if np.isclose(assoc_win.lower_bound, window_config.upper_bound, rtol=0.0, atol=1e-12)
+            else energies_arr >= assoc_win.lower_bound
+        )
+        high_cond = (
+            energies_arr < assoc_win.upper_bound
+            if np.isclose(assoc_win.upper_bound, window_config.lower_bound, rtol=0.0, atol=1e-12)
+            else energies_arr <= assoc_win.upper_bound
+        )
+        scatter_mask = low_cond & high_cond
+        if np.any(scatter_mask):
+            scatter_hist, _, _ = np.histogram2d(
+                x_arr[scatter_mask],
+                y_arr[scatter_mask],
+                bins=(edges_x, edges_y),
+            )
+            projection += float(assoc_win.scatter_weight) * scatter_hist
+
+    if clip_negative and not (window_config.is_scatter_window and main_weight < 0.0):
+        np.clip(projection, 0.0, None, out=projection)
+
+    return projection
+
+
 def build_projection_for_energy_window(
     energies: NDArray[np.floating],
     coords_x: NDArray[np.floating],
@@ -58,38 +114,15 @@ def build_projection_for_energy_window(
     edges_x = np.linspace(-half_width, half_width, num_bins_x + 1, dtype=np.float64)
     edges_y = np.linspace(-half_height, half_height, num_bins_y + 1, dtype=np.float64)
 
-    projection = np.zeros((num_bins_x, num_bins_y), dtype=np.float64)
-    if energies_arr.size == 0:
-        return projection
-
-    main_weight = (
-        float(window_config.scatter_weight)
-        if window_config.is_scatter_window and window_config.scatter_weight != 0.0
-        else 1.0
+    return _accumulate_window_projection(
+        energies_arr=energies_arr,
+        x_arr=x_arr,
+        y_arr=y_arr,
+        edges_x=edges_x,
+        edges_y=edges_y,
+        window_config=window_config,
+        clip_negative=clip_negative,
     )
-    main_mask = (energies_arr >= window_config.lower_bound) & (energies_arr <= window_config.upper_bound)
-    if np.any(main_mask):
-        main_hist, _, _ = np.histogram2d(
-            x_arr[main_mask],
-            y_arr[main_mask],
-            bins=(edges_x, edges_y),
-        )
-        projection += main_weight * main_hist.astype(np.float64)
-
-    for assoc_win in window_config.associated_windows:
-        scatter_mask = (energies_arr >= assoc_win.lower_bound) & (energies_arr <= assoc_win.upper_bound)
-        if np.any(scatter_mask):
-            scatter_hist, _, _ = np.histogram2d(
-                x_arr[scatter_mask],
-                y_arr[scatter_mask],
-                bins=(edges_x, edges_y),
-            )
-            projection += float(assoc_win.scatter_weight) * scatter_hist.astype(np.float64)
-
-    if clip_negative:
-        np.clip(projection, 0.0, None, out=projection)
-
-    return projection
 
 
 def generate_projections_from_events(
@@ -121,8 +154,14 @@ def generate_projections_from_events(
         raise ValueError(f"Некорректные габариты детектора detector_size: {detector_size}")
 
     num_views = len(events_list)
-    num_bins_x = max(1, round(float(detector_size[0]) / float(pixel_size)))
-    num_bins_y = max(1, round(float(detector_size[1]) / float(pixel_size)))
+    det_width = float(detector_size[0])
+    det_height = float(detector_size[1])
+    num_bins_x = max(1, round(det_width / float(pixel_size)))
+    num_bins_y = max(1, round(det_height / float(pixel_size)))
+    half_width = 0.5 * det_width
+    half_height = 0.5 * det_height
+    edges_x = np.linspace(-half_width, half_width, num_bins_x + 1, dtype=np.float64)
+    edges_y = np.linspace(-half_height, half_height, num_bins_y + 1, dtype=np.float64)
 
     per_window_projections: dict[str, NDArray[np.float64]] = {}
     for win_cfg in energy_windows:
@@ -139,17 +178,17 @@ def generate_projections_from_events(
                 raise ValueError(
                     f"Элемент events_list[{view_idx}] должен иметь форму (M, 5), получено: {events_arr.shape}"
                 )
-            energies = events_arr[:, 2]
-            coords_x = events_arr[:, 3]
-            coords_y = events_arr[:, 4]
+            energies = np.ascontiguousarray(events_arr[:, 2])
+            coords_x = np.ascontiguousarray(events_arr[:, 3])
+            coords_y = np.ascontiguousarray(events_arr[:, 4])
 
         for win_cfg in energy_windows:
-            frame_proj = build_projection_for_energy_window(
-                energies=energies,
-                coords_x=coords_x,
-                coords_y=coords_y,
-                detector_size=detector_size,
-                pixel_size=pixel_size,
+            frame_proj = _accumulate_window_projection(
+                energies_arr=energies,
+                x_arr=coords_x,
+                y_arr=coords_y,
+                edges_x=edges_x,
+                edges_y=edges_y,
                 window_config=win_cfg,
                 clip_negative=clip_negative,
             )
