@@ -1,0 +1,93 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nmspecttoolkit"
+version = "0.2.0"
+description = "Программный комплекс постобработки, спектрометрии, экспорта и 3D-реконструкции данных ОФЭКТ (SPECT)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Mikhail Gurko" }
+]
+dependencies = [
+    "numpy>=2.0.0",
+    "scipy>=1.14.0",
+    "h5py>=3.11.0",
+    "hepunits>=2.3.0",
+    "pydicom>=2.4.0",
+    "vtk>=9.3.0",
+    "matplotlib>=3.9.0",
+    "pillow>=10.0.0",
+    "PyQt6>=6.8.0",
+    "pyqtgraph>=0.13.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "mypy>=1.10.0",
+    "ruff>=0.4.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "mypy>=1.10.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+nmspect-process = "nmspect.cli.process:main"
+nmspect-reconstruct = "nmspect.cli.reconstruct:main"
+nmspect-nexus = "nmspect.cli.inspect_nexus:main"
+nmspect-view-vtk = "nmspect.cli.viewers:main_vtk"
+nmspect-view-spectrum = "nmspect.cli.viewers:main_spectrum"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nmspect*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+exclude = [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "data",
+    "results",
+    "docs",
+]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+exclude = ["data", "results", "docs"]
+
+[[tool.mypy.overrides]]
+module = [
+    "vtk.*",
+    "hepunits.*",
+    "scipy.*",
+    "h5py.*",
+    "pydicom.*",
+    "pyqtgraph.*",
+    "PIL.*",
+]
+ignore_missing_imports = true
+
