@@ -9,8 +9,12 @@ from hepunits import keV, mm, ns
 from nmspect.detector import (
     ProjectionBuilder,
     ScintillationProcessor,
+    aggregate_energy_weighted_segments,
     build_projection_for_energy_window,
+    compute_spatial_offsets_2d,
     generate_projections_from_events,
+    normalize_energy_resolution,
+    smear_scintillation_energy,
 )
 from nmspect.spectrometry import (
     TB161_PEAK_75_DEW_WINDOW,
@@ -170,3 +174,83 @@ def test_projection_builder_validation_and_window_clipping() -> None:
         clip_negative=False,
     )
     assert np.isclose(np.sum(tew_boundary_proj), 2.0)
+
+
+def test_shared_scintillation_kernel_functions() -> None:
+    """Проверяет единые векторные функции сцинтилляционного отклика для 2D актов и 3D треков."""
+    assert np.isclose(normalize_energy_resolution(9.9), 0.099)
+    assert np.isclose(normalize_energy_resolution(0.099), 0.099)
+    with pytest.raises(ValueError):
+        normalize_energy_resolution(-0.01)
+
+    starts = np.array([0, 2, 4], dtype=np.int64)
+    edeps = np.array([25.0 * keV, 50.0 * keV, 0.0 * keV, 0.0 * keV, 100.0 * keV], dtype=np.float64)
+    coords_3d = np.array(
+        [
+            [0.0, 0.0, 3.0],
+            [0.0, 0.0, 9.0],
+            [10.0, 20.0, 30.0],
+            [20.0, 40.0, 50.0],
+            [-5.0, 5.0, 2.0],
+        ],
+        dtype=np.float64,
+    ) * float(mm)
+    times = np.array([1.0, 4.0, 10.0, 12.0, 20.0], dtype=np.float64) * float(ns)
+    fb_coords = np.array([[0.0, 0.0, 0.0], [15.0, 30.0, 40.0], [0.0, 0.0, 0.0]], dtype=np.float64) * float(mm)
+    fb_times = np.array([0.0, 11.0, 0.0], dtype=np.float64) * float(ns)
+
+    summed_e, pos_mask, centroids, mean_t = aggregate_energy_weighted_segments(
+        segment_starts=starts,
+        energy_deposits=edeps,
+        coordinates=coords_3d,
+        times=times,
+        fallback_coordinates=fb_coords,
+        fallback_times=fb_times,
+    )
+    assert list(pos_mask) == [True, False, True]
+    assert np.allclose(summed_e, [75.0 * keV, 0.0 * keV, 100.0 * keV])
+    assert np.isclose(centroids[0, 2], 7.0 * mm)
+    assert np.allclose(centroids[1], [15.0 * mm, 30.0 * mm, 40.0 * mm])
+    assert np.isclose(mean_t[0], 3.0 * ns)
+    assert np.isclose(mean_t[1], 11.0 * ns)
+
+    smeared = smear_scintillation_energy(
+        deposited_energies=summed_e,
+        energy_resolution=9.9,
+        reference_energy=140.5 * keV,
+        rng=np.random.default_rng(7),
+        active_mask=pos_mask,
+    )
+    assert smeared[0] > 0.0
+    assert smeared[1] == 0.0
+    assert smeared[2] > 0.0
+
+    offsets_scaled = compute_spatial_offsets_2d(
+        num_events=3,
+        intrinsic_spatial_resolution=3.8 * mm,
+        rng=np.random.default_rng(7),
+        deposited_energies=summed_e,
+        reference_energy=140.5 * keV,
+        scale_with_energy=True,
+        active_mask=pos_mask,
+    )
+    assert offsets_scaled.shape == (3, 2)
+    assert np.allclose(offsets_scaled[1], [0.0, 0.0])
+
+    # Энергетическое масштабирование пространственного размытия напрямую в ScintillationProcessor
+    scaled_proc = ScintillationProcessor(
+        time_resolution=200.0 * ns,
+        energy_resolution=0.099,
+        intrinsic_spatial_resolution=3.8 * mm,
+        rng=123,
+        scale_spatial_with_energy=True,
+    )
+    raw_pair = np.array(
+        [
+            [1.0, 10.0 * ns, 35.0 * keV, 0.0 * mm, 0.0 * mm],
+            [2.0, 20.0 * ns, 140.5 * keV, 0.0 * mm, 0.0 * mm],
+        ],
+        dtype=np.float64,
+    )
+    proc_events, _ = scaled_proc.process_detector_acts(raw_pair)
+    assert proc_events.shape == (2, 5)

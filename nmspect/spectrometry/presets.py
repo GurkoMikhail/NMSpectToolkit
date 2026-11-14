@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from hepunits import keV
+from typing import Any
 
-from nmspect.spectrometry.models import EnergyWindowConfig
+import numpy as np
+from hepunits import keV
+from numpy.typing import NDArray
+
+from nmspect.spectrometry.models import EmissionBandConfig, EnergyWindowConfig
 from nmspect.spectrometry.scatter import calculate_dew_coefficient, calculate_tew_coefficients
 
 # ---------------------------------------------------------------------------
@@ -157,6 +161,77 @@ TB161_PEAK_75_TEW_WINDOW = EnergyWindowConfig(
     associated_windows=(TB161_SCATTER_75_LOW, TB161_SCATTER_75_HIGH),
 )
 
+# Симметричные 10%-ные подокна TEW и калиброванный двухпиковый протокол 161Tb (протокол NEMA Symbia)
+_tb161_sym_49_low_w, _tb161_sym_49_high_w = calculate_tew_coefficients(
+    main_lower=44.0 * keV,
+    main_upper=53.8 * keV,
+    low_scatter_lower=39.1 * keV,
+    low_scatter_upper=44.0 * keV,
+    high_scatter_lower=53.8 * keV,
+    high_scatter_upper=58.7 * keV,
+)
+TB161_SCATTER_49_SYM_LOW = EnergyWindowConfig(
+    name="scatter_49_sym_low",
+    lower_bound=39.1 * keV,
+    upper_bound=44.0 * keV,
+    primary_peak=TB161_PEAK_49,
+    description="Нижнее 10%-ное окно TEW для пика 48.9 кэВ (39.1–44.0 кэВ)",
+    is_scatter_window=True,
+    scatter_weight=_tb161_sym_49_low_w,
+)
+TB161_SCATTER_49_SYM_HIGH = EnergyWindowConfig(
+    name="scatter_49_sym_high",
+    lower_bound=53.8 * keV,
+    upper_bound=58.7 * keV,
+    primary_peak=TB161_PEAK_49,
+    description="Верхнее 10%-ное окно TEW для пика 48.9 кэВ (53.8–58.7 кэВ)",
+    is_scatter_window=True,
+    scatter_weight=_tb161_sym_49_high_w,
+)
+TB161_PEAK_49_TEW_SYM_WINDOW = EnergyWindowConfig(
+    name="peak_49_tew_sym",
+    lower_bound=44.0 * keV,
+    upper_bound=53.8 * keV,
+    primary_peak=TB161_PEAK_49,
+    description="Окно 48.9 кэВ (44.0–53.8 кэВ) с симметричным TEW (39.1–44.0 и 53.8–58.7 кэВ)",
+    associated_windows=(TB161_SCATTER_49_SYM_LOW, TB161_SCATTER_49_SYM_HIGH),
+)
+
+_tb161_sym_75_low_w, _tb161_sym_75_high_w = calculate_tew_coefficients(
+    main_lower=67.1 * keV,
+    main_upper=82.0 * keV,
+    low_scatter_lower=59.7 * keV,
+    low_scatter_upper=67.1 * keV,
+    high_scatter_lower=82.0 * keV,
+    high_scatter_upper=89.5 * keV,
+)
+TB161_SCATTER_75_SYM_LOW = EnergyWindowConfig(
+    name="scatter_75_sym_low",
+    lower_bound=59.7 * keV,
+    upper_bound=67.1 * keV,
+    primary_peak=TB161_PEAK_75,
+    description="Нижнее 10%-ное окно TEW для пика 74.6 кэВ (59.7–67.1 кэВ)",
+    is_scatter_window=True,
+    scatter_weight=_tb161_sym_75_low_w,
+)
+TB161_SCATTER_75_SYM_HIGH = EnergyWindowConfig(
+    name="scatter_75_sym_high",
+    lower_bound=82.0 * keV,
+    upper_bound=89.5 * keV,
+    primary_peak=TB161_PEAK_75,
+    description="Верхнее 10%-ное окно TEW для пика 74.6 кэВ (82.0–89.5 кэВ)",
+    is_scatter_window=True,
+    scatter_weight=_tb161_sym_75_high_w,
+)
+TB161_PEAK_75_TEW_SYM_WINDOW = EnergyWindowConfig(
+    name="peak_75_tew_sym",
+    lower_bound=67.1 * keV,
+    upper_bound=82.0 * keV,
+    primary_peak=TB161_PEAK_75,
+    description="Окно 74.6 кэВ (67.1–82.0 кэВ) с симметричным TEW (59.7–67.1 и 82.0–89.5 кэВ)",
+    associated_windows=(TB161_SCATTER_75_SYM_LOW, TB161_SCATTER_75_SYM_HIGH),
+)
+
 TB161_ENERGY_WINDOW_PRESETS: dict[str, tuple[EnergyWindowConfig, ...]] = {
     "peak49": (TB161_PEAK_49_WINDOW,),
     "peak75": (TB161_PEAK_75_WINDOW,),
@@ -165,6 +240,9 @@ TB161_ENERGY_WINDOW_PRESETS: dict[str, tuple[EnergyWindowConfig, ...]] = {
     "peak49_tew": (TB161_PEAK_49_TEW_WINDOW,),
     "peak75_dew": (TB161_PEAK_75_DEW_WINDOW,),
     "peak75_tew": (TB161_PEAK_75_TEW_WINDOW,),
+    "peak49_tew_sym": (TB161_PEAK_49_TEW_SYM_WINDOW,),
+    "peak75_tew_sym": (TB161_PEAK_75_TEW_SYM_WINDOW,),
+    "dual_peak_tew_sym": (TB161_PEAK_49_TEW_SYM_WINDOW, TB161_PEAK_75_TEW_SYM_WINDOW),
 }
 
 # ---------------------------------------------------------------------------
@@ -370,3 +448,159 @@ def format_presets_summary(isotope: str | None = None) -> str:
             )
             lines.append(f"  - {key:<22}: {win_descriptions} — {windows[0].description}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Пресеты полос начальной эмиссии радионуклидов и автоматическая кластеризация
+# ---------------------------------------------------------------------------
+TB161_EMISSION_BANDS: tuple[EmissionBandConfig, ...] = (
+    EmissionBandConfig(
+        name="band_26",
+        lower_bound=0.0 * keV,
+        upper_bound=35.0 * keV,
+        label="25,7 кэВ",
+        include_lower=True,
+    ),
+    EmissionBandConfig(
+        name="band_49_multiplet",
+        lower_bound=35.0 * keV,
+        upper_bound=65.0 * keV,
+        label="Мультиплет 45–59 кэВ",
+        include_lower=False,
+    ),
+    EmissionBandConfig(
+        name="band_75_multiplet",
+        lower_bound=65.0 * keV,
+        upper_bound=82.0 * keV,
+        label="Дублет 74,6–77,4 кэВ",
+        include_lower=False,
+    ),
+    EmissionBandConfig(
+        name="band_88_106",
+        lower_bound=82.0 * keV,
+        upper_bound=150.0 * keV,
+        label="Линии 87,9–106,1 кэВ",
+        include_lower=False,
+    ),
+    EmissionBandConfig(
+        name="band_high_gamma",
+        lower_bound=150.0 * keV,
+        upper_bound=float("inf"),
+        label="Высокоэнергетические γ (>150 кэВ)",
+        include_lower=False,
+    ),
+)
+
+TC99M_EMISSION_BANDS: tuple[EmissionBandConfig, ...] = (
+    EmissionBandConfig(
+        name="band_low_xray",
+        lower_bound=0.0 * keV,
+        upper_bound=100.0 * keV,
+        label="Рентгеновские линии (<100 кэВ)",
+        include_lower=True,
+    ),
+    EmissionBandConfig(
+        name="band_140",
+        lower_bound=100.0 * keV,
+        upper_bound=160.0 * keV,
+        label="Основной γ-пик 140,5 кэВ",
+        include_lower=False,
+    ),
+    EmissionBandConfig(
+        name="band_high",
+        lower_bound=160.0 * keV,
+        upper_bound=float("inf"),
+        label="Старшие переходы (>160 кэВ)",
+        include_lower=False,
+    ),
+)
+
+ISOTOPE_EMISSION_BANDS_REGISTRY: dict[str, tuple[EmissionBandConfig, ...]] = {
+    "161Tb": TB161_EMISSION_BANDS,
+    "99mTc": TC99M_EMISSION_BANDS,
+}
+
+
+def get_emission_bands_preset(isotope: str) -> tuple[EmissionBandConfig, ...]:
+    """Возвращает дизъюнктный набор полос начальной энергии эмиссии для заданного радионуклида."""
+    canonical_name = normalize_isotope_name(isotope)
+    return ISOTOPE_EMISSION_BANDS_REGISTRY[canonical_name]
+
+
+def infer_emission_bands_from_energies(
+    emission_energies: NDArray[np.floating[Any]],
+    cluster_gap: float = 12.0 * keV,
+) -> tuple[EmissionBandConfig, ...]:
+    """Автоматически строит полное дизъюнктное разбиение полос эмиссии `[0, +inf)` по массиву энергий рождения.
+
+    Группирует близкие дискретные линии эмиссии, отстоящие не более чем на `cluster_gap`,
+    и ставит границы полос посередине между соседними мультиплетами.
+    """
+    if cluster_gap <= 0.0:
+        raise ValueError(f"Параметр cluster_gap должен быть строго положительным: {cluster_gap}.")
+
+    energies_arr = np.asarray(emission_energies, dtype=np.float64).ravel()
+    positive_vals = energies_arr[np.isfinite(energies_arr) & (energies_arr >= 0.0)]
+    if positive_vals.size == 0:
+        return (
+            EmissionBandConfig(
+                name="band_all",
+                lower_bound=0.0 * keV,
+                upper_bound=float("inf"),
+                label="Весь спектр эмиссии",
+                include_lower=True,
+            ),
+        )
+
+    rounded_kevs = np.unique(np.round(positive_vals / float(keV), decimals=2)) * float(keV)
+    clusters: list[list[float]] = [[float(rounded_kevs[0])]]
+    for line_val in rounded_kevs[1:]:
+        if float(line_val) - clusters[-1][-1] <= float(cluster_gap):
+            clusters[-1].append(float(line_val))
+        else:
+            clusters.append([float(line_val)])
+
+    if len(clusters) == 1:
+        mean_line_value = float(np.mean(clusters[0])) / float(keV)
+        return (
+            EmissionBandConfig(
+                name=f"band_{round(mean_line_value)}",
+                lower_bound=0.0 * keV,
+                upper_bound=float("inf"),
+                label=f"{mean_line_value:.1f} кэВ",
+                include_lower=True,
+            ),
+        )
+
+    bands: list[EmissionBandConfig] = []
+    num_clusters = len(clusters)
+    prev_upper = 0.0
+    for cluster_idx, cluster_lines in enumerate(clusters):
+        is_first = cluster_idx == 0
+        is_last = cluster_idx == num_clusters - 1
+        next_upper = (
+            float("inf")
+            if is_last
+            else 0.5 * (cluster_lines[-1] + clusters[cluster_idx + 1][0])
+        )
+        min_line_value = cluster_lines[0] / float(keV)
+        max_line_value = cluster_lines[-1] / float(keV)
+        if len(cluster_lines) == 1:
+            band_label = f"{min_line_value:.1f} кэВ"
+            band_name = f"band_{round(min_line_value)}"
+        else:
+            band_label = f"{min_line_value:.1f}–{max_line_value:.1f} кэВ"
+            band_name = f"band_{round(min_line_value)}_{round(max_line_value)}"
+
+        bands.append(
+            EmissionBandConfig(
+                name=band_name,
+                lower_bound=prev_upper,
+                upper_bound=next_upper,
+                label=band_label,
+                include_lower=is_first,
+            )
+        )
+        prev_upper = next_upper
+
+    return tuple(bands)

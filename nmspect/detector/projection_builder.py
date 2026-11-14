@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
 
-from nmspect.spectrometry.models import EnergyWindowConfig
+if TYPE_CHECKING:
+    from nmspect.spectrometry.models import EnergyWindowConfig
 
 
 def _accumulate_window_projection(

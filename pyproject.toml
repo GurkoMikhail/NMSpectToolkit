@@ -43,6 +43,7 @@ dev = [
 nmspect-process = "nmspect.cli.process:main"
 nmspect-reconstruct = "nmspect.cli.reconstruct:main"
 nmspect-nexus = "nmspect.cli.inspect_nexus:main"
+nmspect-tracks = "nmspect.cli.track_study:main"
 nmspect-view-vtk = "nmspect.cli.viewers:main_vtk"
 nmspect-view-spectrum = "nmspect.cli.viewers:main_spectrum"
 

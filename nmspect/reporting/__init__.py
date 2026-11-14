@@ -1,0 +1,80 @@
+"""Публичный интерфейс подпакета научной графики, вёрстки OOXML/OMML `.docx` и экспорта отчётов `.pdf`/`.doc`."""
+
+from __future__ import annotations
+
+from nmspect.reporting.converters import DocumentConversionResult, DocumentFormatConverter
+from nmspect.reporting.docx_builder import PageGeometryConfig, ScientificDocxBuilder, render_rich_runs
+from nmspect.reporting.figures import (
+    BAND_PALETTE,
+    TOPOLOGY_PALETTE,
+    plot_angular_calibration_profiles,
+    plot_angular_psf_components,
+    plot_doi_and_roc,
+    plot_emission_band_spectra,
+    plot_experiment_and_topology_schema,
+    plot_planar_projections_grid,
+    plot_psf_2d_and_anisotropy,
+    plot_topology_spectra,
+)
+from nmspect.reporting.omml import (
+    inline_math,
+    latex_to_omml,
+    math_accent,
+    math_column_vector,
+    math_delimiter,
+    math_equation_array,
+    math_fraction,
+    math_nary,
+    math_operator,
+    math_overline,
+    math_radical,
+    math_run,
+    math_sub,
+    math_subsup,
+    math_sup,
+    math_text,
+    math_vector,
+)
+from nmspect.reporting.study_report import (
+    GeneratedStudyReport,
+    ReportMetadataConfig,
+    TrackStudyReportGenerator,
+)
+
+__all__ = [
+    "BAND_PALETTE",
+    "TOPOLOGY_PALETTE",
+    "DocumentConversionResult",
+    "DocumentFormatConverter",
+    "GeneratedStudyReport",
+    "PageGeometryConfig",
+    "ReportMetadataConfig",
+    "ScientificDocxBuilder",
+    "TrackStudyReportGenerator",
+    "inline_math",
+    "latex_to_omml",
+    "math_accent",
+    "math_column_vector",
+    "math_delimiter",
+    "math_equation_array",
+    "math_fraction",
+    "math_nary",
+    "math_operator",
+    "math_overline",
+    "math_radical",
+    "math_run",
+    "math_sub",
+    "math_subsup",
+    "math_sup",
+    "math_text",
+    "math_vector",
+    "plot_angular_calibration_profiles",
+    "plot_angular_psf_components",
+    "plot_doi_and_roc",
+    "plot_emission_band_spectra",
+    "plot_experiment_and_topology_schema",
+    "plot_planar_projections_grid",
+    "plot_psf_2d_and_anisotropy",
+    "plot_topology_spectra",
+    "render_rich_runs",
+]

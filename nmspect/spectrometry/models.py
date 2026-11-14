@@ -3,9 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import IntEnum
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
+
+
+class PhotonComponent(IntEnum):
+    """Укрупнённая 5-компонентная физическая классификация зарегистрированных квантов ОФЭКТ."""
+
+    GEOMETRIC = 0
+    SEPTAL_PENETRATION = 1
+    COLLIMATOR_SCATTER = 2
+    PHANTOM_SCATTER = 3
+    BACKSCATTER = 4
 
 
 @dataclass(frozen=True)
@@ -86,3 +98,48 @@ class SpectrumResult:
     mean_scatter_order: float
     window_purity: float
     window_config: EnergyWindowConfig | None = None
+
+
+@dataclass(frozen=True)
+class EmissionBandConfig:
+    """Конфигурация энергетической полосы начальной эмиссии радионуклида (в базовых единицах hepunits).
+
+    Attributes:
+        name: Уникальное системное имя полосы эмиссии.
+        lower_bound: Нижняя граница начальной энергии рождения в базовых единицах `hepunits` (`MeV`).
+        upper_bound: Верхняя граница начальной энергии рождения в `hepunits` (`MeV`, допускается `inf`).
+        label: Читаемое русскоязычное обозначение полосы для таблиц и легенд графиков.
+        include_lower: Включать ли левую границу (`>= lower_bound`), иначе строго больше (`> lower_bound`).
+    """
+
+    name: str
+    lower_bound: float
+    upper_bound: float
+    label: str = ""
+    include_lower: bool = False
+
+    def __post_init__(self) -> None:
+        """Проверяет корректность границ полосы начальной энергии."""
+        if self.lower_bound < 0.0:
+            raise ValueError(f"Нижняя граница полосы эмиссии '{self.name}' не может быть отрицательной.")
+        if self.upper_bound <= self.lower_bound:
+            raise ValueError(
+                f"Верхняя граница полосы эмиссии '{self.name}' ({self.upper_bound}) "
+                f"должна быть строго больше нижней ({self.lower_bound})."
+            )
+
+    def matches(self, emission_energies: NDArray[np.floating[Any]]) -> NDArray[np.bool_]:
+        """Возвращает булеву маску попадания начальных энергий рождения в данную полосу."""
+        energies_arr = np.asarray(emission_energies, dtype=np.float64)
+        lower_mask = (
+            energies_arr >= self.lower_bound if self.include_lower else energies_arr > self.lower_bound
+        )
+        return np.asarray(lower_mask & (energies_arr <= self.upper_bound), dtype=np.bool_)
+
+
+__all__ = [
+    "EmissionBandConfig",
+    "EnergyWindowConfig",
+    "PhotonComponent",
+    "SpectrumResult",
+]
